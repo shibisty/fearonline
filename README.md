@@ -282,6 +282,7 @@ the login window closes.
 
 # EXE/DLL Tree
 
+```
 [C:\PROGRAM FILES (X86)\STEAM\STEAMAPPS\COMMON\FEAR ONLINE](docs/tree.md)
 |== aeria_launcher.exe
 |== Aeria_web.ico
@@ -393,3 +394,4 @@ L---LauncherData
 |==|==|==|==|==|==steam_api.dll
 |==|==|==|==|==|==steam_appid.txt
 |==|==|==|==|==|==ZLauncher.dll
+```
