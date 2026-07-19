@@ -335,3 +335,61 @@ the login window closes.
 |== |== |== SKULowViolence.cfg
 |== |== |== Version.cfg
 |== |== |== [ZNetwork.dll](docs/ZNetwork.dll.md)
+L---LauncherData
+|==|==||== [Config.xml](docs/Config.xml.md)
+|==|==||== ZAeria.dll
+|==|==||== 
+|==|==+---Language
+|==|==||== +---common
+|==|==||== ||==|==|== bg.bmp
+|==|==||== ||==|==|== bgm.wav
+|==|==||== ||==|==|== BG_launcher_bottom.bmp
+|==|==||== ||==|==|== BG_launcher_top.bmp
+|==|==||== ||==|==|== BtnClose.bmp
+|==|==||== ||==|==|== btnDownClose.wav
+|==|==||== ||==|==|== btnDownMinimize.wav
+|==|==||== ||==|==|== btnDownStart.wav
+|==|==||== ||==|==|== BtnMinimize.bmp
+|==|==||== ||==|==|== btnOver.wav
+|==|==||== ||==|==|== btnOverClose.wav
+|==|==||== ||==|==|== btnOverMenu.wav
+|==|==||== ||==|==|== btnOverMinimize.wav
+|==|==||== ||==|==|== btnOverStart.wav
+|==|==||== ||==|==|== btnOverStart01.wav
+|==|==||== ||==|==|== btnOverStart02.wav
+|==|==||== ||==|==|== btnOverStart03.wav
+|==|==||== ||==|==|== btnStart.bmp
+|==|==||== ||==|==|== BTN_check.bmp
+|==|==||== ||==|==|== BTN_close.bmp
+|==|==||== ||==|==|== BTN_minimize.bmp
+|==|==||== ||==|==|== BTN_notice.BMP
+|==|==||== ||==|==|== BTN_soundOFF.bmp
+|==|==||== ||==|==|== BTN_soundON.bmp
+|==|==||== ||==|==|== BTN_start.bmp
+|==|==||== ||==|==|== BTN_support.bmp
+|==|==||== ||==|==|== gauge_independent.bmp
+|==|==||== ||==|==|== gauge_total.bmp
+|==|==||== ||==|==|== 
+|==|==||== +---en
+|==|==||== ||==|==|== Text.xml
+|==|==||== ||==|==|== 
+|==|==||== +---ko
+|==|==||== ||==|==|== Text.xml
+|==|==||== ||==|==|== 
+|==|==||== +---kr
+|==|==||== ||==|==|== Text.xml
+|==|==||== ||==|==|== 
+|==|==||== L---th
+|==|==||==|==|==|==|== Text.xml
+|==|==||==|==|==|==|== 
+|==|==L---Temp
+|==|==|==|==|==|==Config.xml
+|==|==|==|==|==|==ContentsList.xml
+|==|==|==|==|==|==DeleteList.xml
+|==|==|==|==|==|==Language.pd
+|==|==|==|==|==|==Launcher.exe
+|==|==|==|==|==|==PrerequisiteList.xml
+|==|==|==|==|==|==sdkencryptedappticket.dll
+|==|==|==|==|==|==steam_api.dll
+|==|==|==|==|==|==steam_appid.txt
+|==|==|==|==|==|==ZLauncher.dll

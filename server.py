@@ -245,54 +245,68 @@ def https_server():
     finally:
         https_srv.server_close()
 
-
 def tcp_client(conn, addr):
-    conn.settimeout(30)
+    print(f"[TCP CONNECT] {addr}")
 
-    print("\n[TCP CONNECT]", addr)
+    conn.settimeout(10)
 
     try:
         while True:
             try:
                 data = conn.recv(4096)
+
+                if not data:
+                    print(f"[TCP CLOSED] {addr}")
+                    break
+
+                print(f"[TCP RX] {addr}")
+                print("HEX :", data.hex(" "))
+                print("LEN :", len(data))
+
+                # ============================
+                # Экспериментальные ответы
+                # ============================
+
+                # 1. Эхо
+                conn.sendall(data)
+                print("[TCP TX] echo")
+
+                # 2. Если хочешь попробовать другие варианты,
+                # закомментируй echo и раскомментируй один из вариантов:
+
+                # conn.sendall(b"\x00" * len(data))
+                # conn.sendall(bytes.fromhex("13 57 05 32 0F 00 00 40"))
+                # conn.sendall(b"OK")
+                # conn.sendall(b"\x01")
+
             except socket.timeout:
-                break
-
-            if not data:
-                break
-
-            print("\n[TCP RX]", addr)
-            print("HEX:", data.hex())
-
-            try:
-                print("TEXT:", data.decode(errors="replace"))
-            except:
-                pass
-
-            conn.sendall(b"OK")
+                continue
+                # print(f"[TCP TIMEOUT] {addr}")
+                # break
 
     except Exception as e:
-        print("TCP ERROR:", e)
+        print("TCP CLIENT ERROR:", e)
 
     finally:
         conn.close()
-        print("[TCP CLOSED]", addr)
+        print(f"[TCP DISCONNECT] {addr}")
 
 
 def tcp_server():
-    global tcp_sock
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    tcp_sock.bind(("0.0.0.0", 30003))
-    tcp_sock.listen()
+    server.bind(("0.0.0.0", 30003))
+    server.listen(16)
 
-    print("[TCP  ] Listening on :30003")
+    print("[TCP] Listening on 0.0.0.0:30003")
 
     while True:
         try:
-            conn, addr = tcp_sock.accept()
+            conn, addr = server.accept()
+
+            print(f"[TCP ACCEPT] {addr}")
 
             threading.Thread(
                 target=tcp_client,
@@ -300,12 +314,14 @@ def tcp_server():
                 daemon=True
             ).start()
 
-        except OSError:
+        except KeyboardInterrupt:
+            print("Stopping...")
             break
+
         except Exception as e:
             print("TCP ACCEPT ERROR:", e)
 
-    tcp_sock.close()
+    server.close()
 
 
 threads = [
