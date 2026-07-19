@@ -269,6 +269,7 @@ def tcp_client(conn, addr):
 
                 # 1. Эхо
                 conn.sendall(data)
+                # conn.sendall(bytes.fromhex("13 57 05 32 00 00 00 40"))
                 print("[TCP TX] echo")
 
                 # 2. Если хочешь попробовать другие варианты,
