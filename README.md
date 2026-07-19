@@ -279,3 +279,59 @@ TCP connection attempt on `LoginServerIP:LoginServerPort`. The earlier
 **Next step:** Process Monitor filtered on `Launcher.exe` and `TCP*`
 operations, to determine whether a `connect()` is even attempted after
 the login window closes.
+
+# EXE/DLL Tree
+
+[C:\PROGRAM FILES (X86)\STEAM\STEAMAPPS\COMMON\FEAR ONLINE](docs/tree.md)
+|== aeria_launcher.exe
+|== Aeria_web.ico
+|== Compare2Requisite.lst
+|== F.E.A.R. Online Website.URL
+|== fearonline_install.ico
+|== Get Aeria Points.URL
+|== [Launcher.exe](docs/Launcher.exe.md)
+|== Launcher.ini
+|== sdkencryptedappticket.dll
+|== steam_api.dll
+|== steam_appid.txt
+|== Uninst.exe
+|== [ZAeria.dll](docs/ZAeria.dll.md)
+|== [ZLauncher.dll](docs/ZLauncher.dll.md)
+|== 
++---FEAR_Online
+|== |== AssertWin32DLL.dll
+|== |== AssertWin32DLLU.dll
+|== |== binkw32.dll
+|== |== dbghelp.dll
+|== |== DumpGen.exe
+|== |== eax.dll
+|== |== [Engine.exe](docs/Engine.exe.md)
+|== |== Game.ini
+|== |== GameDatabase.dll
+|== |== GameDefinitionFile.dll
+|== |== LTMemory.dll
+|== |== Monolith.PropertyGrid.v1.0.dll
+|== |== Monolith.PropertyGrid.v1.0D.dll
+|== |== Monolith.PropertyGrid.v1.0U.dll
+|== |== Monolith.PropertyGrid.v1.0UD.dll
+|== |== PerformanceMon.dll
+|== |== sdkencryptedappticket.dll
+|== |== SecuromPaul.dll
+|== |== steam_api.dll
+|== |== StringEditRuntime.dll
+|== |== symsrv.dll
+|== |== 
+|== +---CSV
+|== |== ==  OptionPatchList.csv
+|== |
+|== +---Game
+|== |== |== ClientFx.fxd
+|== |== |== ClientSession_MH.dll
+|== |== |== dbghelp.dll
+|== |== |== [GameClient.dll](docs/GameClient.dll.md)
+|== |== |== [GameServer.dll](docs/GameServer.dll.md)
+|== |== |== interface.bndl
+|== |== |== SKU.cfg
+|== |== |== SKULowViolence.cfg
+|== |== |== Version.cfg
+|== |== |== [ZNetwork.dll](docs/ZNetwork.dll.md)

@@ -1,4 +1,5 @@
 __pycache__
-./public/LivePatch/ClientFear/*
-./public/LivePatch/Launcher/*
+public/LivePatch/ClientFear/*
+public/LivePatch/Launcher/*
 !.gitkeep
+trash
