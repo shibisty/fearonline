@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+        <link rel="apple-touch-icon" sizes="57x57" href="/assets/icons/apple-icon-57x57.png">
+        <link rel="apple-touch-icon" sizes="60x60" href="/assets/icons/apple-icon-60x60.png">
+        <link rel="apple-touch-icon" sizes="72x72" href="/assets/icons/apple-icon-72x72.png">
+        <link rel="apple-touch-icon" sizes="76x76" href="/assets/icons/apple-icon-76x76.png">
+        <link rel="apple-touch-icon" sizes="114x114" href="/assets/icons/apple-icon-114x114.png">
+        <link rel="apple-touch-icon" sizes="120x120" href="/assets/icons/apple-icon-120x120.png">
+        <link rel="apple-touch-icon" sizes="144x144" href="/assets/icons/apple-icon-144x144.png">
+        <link rel="apple-touch-icon" sizes="152x152" href="/assets/icons/apple-icon-152x152.png">
+        <link rel="apple-touch-icon" sizes="180x180" href="/assets/icons/apple-icon-180x180.png">
+        <link rel="icon" type="image/png" sizes="192x192"  href="/assets/icons/android-icon-192x192.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/assets/icons/favicon-32x32.png">
+        <link rel="icon" type="image/png" sizes="96x96" href="/assets/icons/favicon-96x96.png">
+        <link rel="icon" type="image/png" sizes="16x16" href="/assets/icons/favicon-16x16.png">
+        <link rel="manifest" href="/manifest.json">
+        <meta name="msapplication-TileColor" content="#ffffff">
+        <meta name="msapplication-TileImage" content="/assets/icons/ms-icon-144x144.png">
+        <meta name="theme-color" content="#ffffff">
+        <title>ARMACHAM SECURE ACCESS</title>
+        <link rel="stylesheet" href="/static/css/login.css">
+    </head>
+    <body>
+        <div class="vignette"></div>
+
+        <div class="term">
+            <div class="hazard"></div>
+            <div class="term-inner">
+                <div class="scan"></div>
+
+                <p class="eyebrow"><span class="dot"></span>LINK ESTABLISHED &middot; CHANNEL ENCRYPTED</p>
+                <h1>F.E.A.R. Online</h1>
+                <h2>Armacham Secure Access Terminal</h2>
+
+                <form id="loginForm" method="post" action="/dialog/oauth/authorize">
+
+                    <div id="errorBox" class="error">ACCESS DENIED &mdash; CREDENTIALS NOT RECOGNIZED</div>
+
+                    <div class="field">
+                        <label for="username">Operator ID <span class="req">*</span></label>
+                        <div class="input-row" id="userRow">
+                            <span class="tag">ID</span>
+                            <input type="text" id="username" name="username" autocomplete="username" autocapitalize="off" spellcheck="false">
+                        </div>
+                    </div>
+
+                    <div class="field">
+                        <label for="password">Access Key <span class="req">*</span></label>
+                        <div class="input-row" id="passRow">
+                            <span class="tag">KEY</span>
+                            <input type="password" id="password" name="password" autocomplete="current-password">
+                        </div>
+                    </div>
+
+                    <input type="hidden" id="client_id" name="client_id" value="">
+                    <input type="hidden" id="state" name="state" value="">
+                    <input type="hidden" id="redirect_uri" name="redirect_uri" value="">
+                    <input type="hidden" id="response_type" name="response_type" value="">
+
+                    <button type="submit" class="submit">Authenticate</button>
+                </form>
+
+                <div class="foot">
+                    <span>SESSION <span id="sessionId">------</span></span>
+                    <span class="ok">&#9679; SERVER ONLINE</span>
+                </div>
+            </div>
+        </div>
+
+        <script src="/static/js/login.js"></script>
+
+    </body>
+</html>
