@@ -211,6 +211,8 @@ A separate DLL of interest — its exports contain every in-game player
 action. These are likely hooked to in-game events elsewhere, in the
 `.exe` or another DLL.
 
+There are traces of ProudNet, but the SDK version is unknown.
+
 ---
 
 ## Engine.exe command-line syntax — trial results
@@ -279,6 +281,25 @@ TCP connection attempt on `LoginServerIP:LoginServerPort`. The earlier
 **Next step:** Process Monitor filtered on `Launcher.exe` and `TCP*`
 operations, to determine whether a `connect()` is even attempted after
 the login window closes.
+
+# ZNetwork Proxy
+
+DLL injection method.
+Install Visual Studio (the Community Edition is free) with the Desktop development with C++ workload. Make sure the x86 (Win32) target is installed—not just x64.
+Open the "x86 Native Tools Command Prompt for VS 2022" (search for it in the Start menu). Be sure to use the x86 prompt, not x64 or x64_x86.
+
+## Navigate to the folder containing the files:
+
+```
+cd C:\path\to\znetwork_proxy
+```
+
+## Compile the DLL:
+```
+cl /LD /MT znetwork_proxy.cpp /link /DEF:znetwork_proxy.def /OUT:ZNetwork.dll
+```
+
+This method allows you to log all calls made within ZNetwork.dll and may help you implement your own protocol, bypassing the original ProduNet protocol.
 
 # EXE/DLL Tree
 

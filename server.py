@@ -324,11 +324,51 @@ def tcp_server():
 
     server.close()
 
+def udp_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    server.bind(("0.0.0.0", 30003))
+
+    print("[UDP ] Listening on 0.0.0.0:30003")
+
+    while True:
+        try:
+            data, addr = server.recvfrom(65535)
+
+            print(f"[UDP RX] {addr}")
+            print("HEX :", data.hex(" "))
+            print("LEN :", len(data))
+
+            # =====================================
+            # Экспериментальные ответы
+            # =====================================
+
+            # 1. Echo
+            server.sendto(data, addr)
+            print("[UDP TX] echo")
+
+            # Можно попробовать другие варианты:
+            #
+            # server.sendto(b"\x00"*len(data), addr)
+            #
+            # server.sendto(bytes.fromhex(
+            #     "13 57 05 32 0F 00 00 40"
+            # ), addr)
+
+        except KeyboardInterrupt:
+            break
+
+        except Exception as e:
+            print("UDP ERROR:", e)
+
+    server.close()
 
 threads = [
     threading.Thread(target=http_server, daemon=True),
     threading.Thread(target=https_server, daemon=True),
     threading.Thread(target=tcp_server, daemon=True),
+    threading.Thread(target=udp_server, daemon=True),
 ]
 
 for t in threads:
