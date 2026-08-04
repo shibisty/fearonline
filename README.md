@@ -42,7 +42,7 @@ a private server.
 ```
 
 ## Python custom server
-The server listens on ports **80/443/30003** (http/https/tcp respectively).
+The server listens on ports **80/443/30003** (http/https/tcp/udp respectively).
 
 Firstly, copy files from C:\Program Files (x86)\Steam\steamapps\common\FEAR Online\LauncherData\Temp to ./public/LivePatch/ClientFear 
 and C:\Program Files (x86)\Steam\steamapps\common\FEAR Online\LauncherData\Temp\Config.xml to ./public/LivePatch/Launcher.
