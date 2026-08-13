@@ -35,17 +35,17 @@ static void Log(const char* fmt, ...) {
 
 // ------------- Свои реализации: 0 параметров -------------
 
-static BYTE g_buf_GetServerData[4096] = {0};
+static BYTE g_buf_GetServerData[65536] = {0};
 extern "C" DWORD __stdcall GetServerData() {
     EnsureInitialized();
-    Log("[ZNetworkProxy][CUSTOM] GetServerData() -> 0x%p (zeroed 4096-byte buffer)\n", g_buf_GetServerData);
+    Log("[ZNetworkProxy][CUSTOM] GetServerData() -> 0x%p (zeroed 65536-byte buffer)\n", g_buf_GetServerData);
     return (DWORD)(void*)g_buf_GetServerData;
 }
 
-static BYTE g_buf_GetServerHostData[4096] = {0};
+static BYTE g_buf_GetServerHostData[65536] = {0};
 extern "C" DWORD __stdcall GetServerHostData() {
     EnsureInitialized();
-    Log("[ZNetworkProxy][CUSTOM] GetServerHostData() -> 0x%p (zeroed 4096-byte buffer)\n", g_buf_GetServerHostData);
+    Log("[ZNetworkProxy][CUSTOM] GetServerHostData() -> 0x%p (zeroed 65536-byte buffer)\n", g_buf_GetServerHostData);
     return (DWORD)(void*)g_buf_GetServerHostData;
 }
 
@@ -8039,13 +8039,15 @@ extern "C" int __stdcall LoginServer_EX(const char* ip, short port, const wchar_
     Log("[ZNetworkProxy] LoginServer_EX(ip=%ls, port=%d, pb=%ls, uid=%ls, extra=0x%p)\n",
         ip ? (const wchar_t*)ip : L"(null)", port, pb ? pb : L"(null)",
         uid ? (const wchar_t*)uid : L"(null)", extra);
-    if (!g_realLoginServerEx) {
-        Log("[ZNetworkProxy] !!! real LoginServer_EX not resolved !!!\n");
-        return 0;
-    }
-    int result = g_realLoginServerEx(ip, port, pb, uid, extra);
-    Log("[ZNetworkProxy] LoginServer_EX -> real result = %d\n", result);
-    return result;
+    // ВАЖНО: реальный ZNetwork_orig.dll крашится (DEP violation, jump в мусор) в
+    // своём фоновом потоке при разборе нашего эхо-ответа на этапе реального логина
+    // (после нажатия Login с введёнными данными) -- воспроизвести настоящий
+    // ProudNet-протокол (шифрование, protocolVersion GUID) не входит в задачу.
+    // Поэтому LoginServer_EX теперь ПОЛНОСТЬЮ своя -- без обращения к реальной
+    // сети вообще. Дальше нужно вручную решить, как/когда вызывать
+    // Set_On_LOGIN_DATA_Callback с нужными данными.
+    Log("[ZNetworkProxy] LoginServer_EX -> FAKE success, no real ProudNet network call\n");
+    return 1;
 }
 
 extern "C" void __stdcall DisConnect() {
