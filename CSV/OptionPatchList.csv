@@ -1,1 +1,4 @@
 MapIndex,FileName,MapRecord,FileSize,FileTime
+1,map1.bin,Map1,1024,20240101
+2,map2.bin,Map2,2048,20240101
+3,map3.bin,Map3,3072,20240101

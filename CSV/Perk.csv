@@ -1,1 +1,6 @@
 PerkIndex,AbleToMode,timeKeep,ReleaseType,ReleaseValue,condition,cValue,effect1,effect2,eOperator1,eOperator2,eValue1,eValue2,SubName,Description,Comment,Summary,HideConditionValue,HudOverlayFXName
+1,0,0,0,0,0,0,0,0,0,0,0,0,Perk1,Test Perk,Test,Perk1,0,0
+2,0,0,0,0,0,0,0,0,0,0,0,0,Perk2,Test Perk 2,Test,Perk2,0,0
+3,0,0,0,0,0,0,0,0,0,0,0,0,Perk3,Test Perk 3,Test,Perk3,0,0
+4,0,0,0,0,0,0,0,0,0,0,0,0,Perk4,Test Perk 4,Test,Perk4,0,0
+5,0,0,0,0,0,0,0,0,0,0,0,0,Perk5,Test Perk 5,Test,Perk5,0,0

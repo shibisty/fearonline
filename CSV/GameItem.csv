@@ -1,1 +1,19 @@
 ItemIndex,RecordName,RepresentIndex,HighGroup,MiddleGroup,FunctionIndex,IsResell,ResellPoint,PointPrice,CashPrice,BonusPoint,CashType,IsSell,DisplayOrder,IsShopShow,IsNew,NewBeginTime,NewEndTime,IsHot,HotBeginTime,HotEndTime,IsSale,SaleBeginTime,SaleEndTime,SalePrice,UseType,Durability,UseTime,UseCount,IsMerge,Cangift,RepairPoint,EngName,BuyPopupOrder,ItemDesc,Attack,Accuracy,Stability,ShotSpeed,Carry,Magazine,Supply,IsInvenShow,BuyLevelLimit,EquipLevelLimit,UseState,SlotCount,WeaponType,CapsuleGrade
+1,Fernando Silva,0,0,0,0,1,0,409,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,FernandoSilva,0,A.T.C. Soldier,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+2,Crimson,0,0,0,0,1,0,499,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,Crimson,0,A.T.C. Commander,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+3,Emily Roth,0,0,0,0,1,0,589,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,EmilyRoth,0,A.T.C. Sniper,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+4,Jason Blair,0,0,0,0,1,0,409,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,JasonBlair,0,A.T.C. Specialist,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+5,Eric Roth,0,0,0,0,1,0,499,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,EricRoth,0,A.T.C. Medic,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+6,Natalie,0,0,0,0,1,0,589,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,Natalie,0,A.T.C. Scout,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+7,Vincent,0,0,0,0,1,0,0,2526,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,Vincent,0,T.F. Soldier,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+8,Bill Walker,0,0,0,0,1,0,0,2526,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,BillWalker,0,T.F. Commander,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+9,Dominic Jarvis,0,0,0,0,1,0,0,3024,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,DominicJarvis,0,T.F. Sniper,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+10,Mark Edwin,0,0,0,0,1,0,0,3024,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,MarkEdwin,0,T.F. Specialist,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+11,Valentina Dario,0,0,0,0,1,0,0,3528,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,ValentinaDario,0,T.F. Medic,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+12,Erica Lin,0,0,0,0,1,0,0,3528,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,EricaLin,0,T.F. Scout,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+13,A.T.C. Rifle,0,0,0,0,1,0,599,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,ATCRifle,0,A.T.C. Assault Rifle,5,4,3,3,30,30,10,1,0,1,0,1,0,0
+14,T.F. Rifle,0,0,0,0,1,0,0,1999,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,TFRifle,0,T.F. Assault Rifle,6,5,4,4,35,30,12,1,0,1,0,1,0,0
+15,A.T.C. Pistol,0,0,0,0,1,0,299,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,ATCPistol,0,A.T.C. Sidearm,2,2,3,3,15,12,5,1,0,1,0,1,0,0
+16,T.F. Pistol,0,0,0,0,1,0,0,999,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,TFPistol,0,T.F. Sidearm,3,3,4,4,18,12,6,1,0,1,0,1,0,0
+17,A.T.C. Armor,0,0,0,0,1,0,799,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,ATCArmor,0,A.T.C. Body Armor,0,0,0,0,0,0,0,1,0,1,0,0,0,0
+18,T.F. Armor,0,0,0,0,1,0,0,2999,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,TFArmor,0,T.F. Body Armor,0,0,0,0,0,0,0,1,0,1,0,0,0,0

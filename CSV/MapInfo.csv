@@ -1,1 +1,7 @@
 MapIndex,MapMode,UnknownColumn4,UserDefault,UnknownColumn7,TimeDefault,UnknownColumn9,KillDefault,UnknownColumn11,GoalDefault,Round,RoundDefault,MapName,ModeName,MapDisplay,ModeDisplay,DisplayOrder,Difficulty,Advantage,Weapon,WinRewardItem,LoseRewardIndex,DrawRewardIndex,TypeStreaming,MatchGame
+1,1,0,0,0,600,0,30,0,5,5,0,Death Match,DM,Death Match,DM,1,1,0,0,0,0,0,0,0
+2,2,0,0,0,600,0,30,0,5,5,0,Scenario,SC,Scenario,SC,2,2,0,0,0,0,0,0,0
+3,3,0,0,0,600,0,30,0,5,5,0,FireStorm,FS,FireStorm,FS,3,3,0,0,0,0,0,0,0
+4,4,0,0,0,600,0,30,0,5,5,0,Clan Match,CM,Clan Match,CM,4,4,0,0,0,0,0,0,0
+5,5,0,0,0,600,0,30,0,5,5,0,Demolition,DM,Demolition,DM,5,5,0,0,0,0,0,0,0
+6,6,0,0,0,600,0,30,0,5,5,0,Knife Fight,KF,Knife Fight,KF,6,6,0,0,0,0,0,0,0

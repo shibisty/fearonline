@@ -13,3 +13,5 @@ public/LivePatch/ClientFear/ZLauncher.dll
 public/LivePatch/Launcher/*
 !.gitkeep
 trash
+*.dll
+*.exe

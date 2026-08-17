@@ -26,88 +26,70 @@ a private server.
 
 ---
 
-## Hosts file (for local development)
-
-```
-127.0.0.1 fearonline.patch.aeriagames.com
-127.0.0.1 www.fearonline.patch.aeriagames.com
-127.0.0.1 fearonline.aeriagames.com
-127.0.0.1 www.fearonline.aeriagames.com
-127.0.0.1 aeriagames.com
-127.0.0.1 www.aeriagames.com
-127.0.0.1 oclient.com
-127.0.0.1 www.oclient.com
-127.0.0.1 test.aeriagames.com
-127.0.0.1 www.test.aeriagames.com
-```
-
-## Python custom server
-The server listens on ports **80/443/30003** (http/https/tcp/udp respectively).
-
-Firstly, copy files from C:\Program Files (x86)\Steam\steamapps\common\FEAR Online\LauncherData\Temp to ./public/LivePatch/ClientFear 
-and C:\Program Files (x86)\Steam\steamapps\common\FEAR Online\LauncherData\Temp\Config.xml to ./public/LivePatch/Launcher.
-
-- Windows
-```
-server.bat
-```
-- Linux
-```
-server.sh
-```
-- or for all with Python 3
-```
-python server.py
-```
-
-## Server endpoints
-| URL | Purpose |
-|---|---|
-| `http://fearonline.patch.aeriagames.com/LivePatch/Launcher/` | Launcher files, used to fetch launcher updates |
-| `http://fearonline.patch.aeriagames.com/LivePatch/ClientFear/` | Files required for the launcher to operate |
-| `http://fearonline.aeriagames.com/fogame/notice` | Launcher home/notice page |
-| `http://www.aeriagames.com/dialog/oauth?response_type=code&state=xyz&scope=scope_general,scope_billing&lang=en&client_id=652064e22d0ba471c6e7befe6fc91c650519e6f1c&redirect_uri=https://www.aeriagames.com/content_only_launcher&` | Login window (OAuth) |
-| `https://www.aeriagames.com/content_only_launcher` | Redirect target where `code=[temp_code]` is returned |
-| `https://www.aeriagames.com/social_connect/steam/connect/callback/redirect` | Likely Steam-linked authentication |
-| `http://fearonline.aeriagames.com/fogame/steam_notice` | Likely the home page for the Steam version |
-| `https://www.aeriagames.com/dialog/oauth/authorize?response_type=code&client_id=652064e22d0ba471c6e7befe6fc91c650519e6f1c&state=xyz&redirect_url=https://www.oclient.com/code2token.php&` | OAuth2 endpoint with redirect |
-| `https://www.oclient.com/code2token.php` | Exchanges `code` → `access_token` |
-| `[ip]:30003` | Port the game connects to after launch (server browser / shop, presumably) |
-
-> `aeriagames.com` and `oclient.com` are completely different domains, yet
-> `oclient` can exchange a code issued by `aeriagames.com` for an
-> `access_token` — implying they share a compatible backend.
-
----
-
-## Launcher.exe
+## New Launcher (In progress)
 
 ![Screenshot](examples/image_1.png)
 
-- Loads **ZLauncher.dll** — contains the callbacks the `.exe` needs to
-  handle authentication events.
-- **ZAeria.dll** — present alongside `Launcher.exe`, but it's unknown
-  whether it's ever actually loaded (no load event for it has been
-  observed either way). It internally references an auth window with
-  the same title as the one shown during login, but this could easily
-  be coincidental — no direct call to that window has been traced from
-  the `.exe` or `ZLauncher.dll` yet, and no confirmation that this DLL
-  is loaded at all.
-- Contacts the server for client version information.
-- **Config.xml** — important file, contains auth hosts and startup settings.
-- Compares versions, downloads some configuration files.
-- Opens the OAuth window (embedded IE 11) — not visible in the F11Chooser debugger.
-- User enters login/password → a temporary `code=` is received.
-- The `code` must be exchanged for an `access_token` (see open questions).
-- On successful authentication, launches `Engine.exe` with the required parameters.
+## Game Patcher
 
-### aeria_launcher.exe
+**Experimental memory patcher for FEAR Online**
 
-A separate, much smaller exe. Likely intended to load `ZAeria.dll`, but
-no evidence of it actually being used in the current launch chain has
-been found.
+### 1. Configure paths
 
-### Registry
+Open `GamePatcher.cpp` and verify the following paths match your FEAR Online installation:
+
+```cpp
+std::string enginePath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\FEAR Online\\FEAR_Online\\Engine.exe";
+std::string workingDirectory = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\FEAR Online\\FEAR_Online";
+```
+
+### 2. Compile
+
+Open **"x86 Native Tools Command Prompt for VS 2022"** from the Start menu, then run:
+
+```bash
+cd C:\path\to\GameClient_patcher
+build.bat
+```
+
+### 3. Run
+
+```bash
+.\GamePatcher.exe
+```
+
+**Important:** Run the patcher as Administrator for memory write operations to succeed.
+
+![Screenshot](examples/image_2.png)
+
+### GameClient.dll Global Variables
+
+The patcher modifies the following global variables in `GameClient.dll`:
+
+| Variable | Offset | Description |
+|----------|--------|-------------|
+| `g_bMonolithMultiplayerFinalBuild` | 0x248A4 | Final build flag |
+| `g_bMonolithMultiplayerIsRanked` | 0x23FFC | Ranked match flag |
+| `g_nMonolithMenuNumUsers` | 0x2264C | Number of users |
+| `g_nMonolithMenuUserMyIndex` | 0x227CC | Current user index |
+| `g_nMonolithMultiplayerMyServerState` | 0x2BA38 | Server connection state |
+| `g_nMonolithMultiplayerMyLevel` | 0x258F8 | Player level |
+| `g_nMonolithMultiplayerMyUserGrade` | 0x25928 | Player grade |
+| `g_nMonolithMultiplayerHangarMyPoint` | 0x2A57C | In-game currency |
+| `g_nMonolithMultiplayerHangarMyCash` | 0x2A5B0 | Cash currency |
+| `g_bMonolithMultiplayerClearTutorial` | 0x2BA6C | Tutorial completion flag |
+| `g_nMonolithMultiplayerLoginWin_PVP` | 0x24F4C | PVP wins |
+| `g_nMonolithMultiplayerLoginDraw_PVP` | 0x24F80 | PVP draws |
+| `g_nMonolithMultiplayerLoginLose_PVP` | 0x24FB4 | PVP losses |
+| `g_nMonolithMultiplayerLoginWin_PVE` | 0x24FE8 | PVE wins |
+| `g_nMonolithMultiplayerLoginLose_PVE` | 0x2501C | PVE losses |
+| `g_nMonolithSystemLayerPlatform` | 0x3892C | Platform type (PC) |
+| `g_nMonolithGlobalLanguage` | 0x2108C | Language (English) |
+| `g_bMonolithGlobalIsCollectorsEdition` | 0x21050 | Collectors edition flag |
+
+---
+
+## Registry
 
 The engine reads/writes a registry key:
 
@@ -139,12 +121,12 @@ attempt to `LoginServerIP:LoginServerPort` (i.e. it passes every
 command-line validation check inside `GameClient.dll`).
 
 ```
-"C:\Program Files (x86)\Steam\steamapps\common\FEAR Online\FEAR_Online\Engine.exe" +PB AE +UIPB none +BANNER 1 +UID test123 +LauncherID 1 +windowed 1 +Lan en +LoginServerIP 127.0.0.1 +LoginServerPort 30003
+"C:\Program Files (x86)\Steam\steamapps\common\FEAR Online\FEAR_Online\Engine.exe" +PB IN +UIPB none +BANNER 0 +UID test123 +LauncherID 1 +windowed 1 +Lan en +LoginServerIP 127.0.0.1 +LoginServerPort 30003
 ```
 
 | Parameter | Meaning / notes |
 |---|---|
-| `PB` | Likely a region/publisher code. Confirmed working value: `AE`. Other known values: `IN`, `NO`, `WI`. |
+| `PB` | Likely a region/publisher code. Confirmed working value: `IN`. Other known values: `AE`, `NO`, `WI`. |
 | `UIPB` | Unclear purpose. Tested with `none`; corresponds to a config field that was empty (`UIPB=""`) in the original launcher config. |
 | `BANNER` | Unclear purpose. Hardcoded to `1` inside `Launcher.exe`. |
 | `UID` | Likely the user's unique account ID. Passed into the command-line builder from an external parameter (`param_2`) — presumably comes from the server response after successful authentication. Tested with an arbitrary placeholder value. |
@@ -165,7 +147,7 @@ Not included in the tested command line (added only conditionally by
 1. `+PB` is checked first.
    - If the key is **missing entirely** → dialog **"Please Excute 'Launch FEAROnline.exe'"** → `PostQuitMessage`.
    - If the key is **present but its value fails a later check** → dialog **"Wrong Argument!"**.
-2. The value `AE` **passes** the initial string comparison, but a
+2. The value `IN` **passes** the initial string comparison, but a
    **region-specific validator function** is then called, which can
    still reject it → "Wrong Argument!" again.
 
@@ -223,16 +205,16 @@ Tested experimentally via x32dbg (breakpoint on the `call eax` inside
 
 | Syntax tried | Result |
 |---|---|
-| `-PB=AE` | Not found (EAX = 0) |
-| `-PB AE` | Not found (EAX = 0) |
+| `-PB=IN` | Not found (EAX = 0) |
+| `-PB IN` | Not found (EAX = 0) |
 | `-PB PB_NoOverride` | Not found (EAX = 0) |
-| `PB AE` (no prefix) | Not found (EAX = 0) |
-| **`+PB AE`** | **Found** (EAX ≠ 0), value `"AE"` matches the string in code |
+| `PB IN` (no prefix) | Not found (EAX = 0) |
+| **`+PB IN`** | **Found** (EAX ≠ 0), value `"IN"` matches the string in code |
 
 **Conclusion: the correct syntax is `+key value`.**
 
-With `+PB AE` alone, the "Please Excute..." dialog changed to **"Wrong
-Argument!"**, confirming the key is found and the value `AE` is
+With `+PB IN` alone, the "Please Excute..." dialog changed to **"Wrong
+Argument!"**, confirming the key is found and the value `IN` is
 recognized, but that in isolation the additional region-specific
 validator was not satisfied.
 
@@ -245,61 +227,20 @@ TCP connection attempt on `LoginServerIP:LoginServerPort`. The earlier
 
 ---
 
-## Open question: user identification
-
-1. `Launcher.exe` performs a full OAuth flow (login → `code` → exchange
-   for `access_token` via `code2token.php`) — this **should not be
-   bypassable via Steam authentication alone**: no publisher with this
-   business model (monetization through its own cash shop and account
-   system) would skip its own account registration, even for a
-   Steam-purchased copy.
-2. Steam's ACF manifest (`LauncherPath: steam.exe`) contains no
-   game-specific launch parameters — Steam itself doesn't launch
-   `Engine.exe` directly; the real entry point is `Launcher.exe`
-   (confirmed via x32dbg logs).
-3. The `OnSteam`/`SteamID` check in `GameClient.dll` is most likely an
-   **additional DRM/anti-piracy ownership check**, not a replacement for
-   the main Aeria authentication.
-4. The real session token/ticket is presumably written by
-   `Launcher.exe` into the registry (near the already-found `USERID`)
-   **after** a successful `code → access_token` exchange — but locally
-   this step never happens yet, since the request to `code2token.php`
-   never completes.
-
-### code2token.php diagnosis — current status
-
-- Hosts are configured correctly (`www.oclient.com` → `127.0.0.1`).
-- OAuth login succeeds: `code` is obtained, the redirect to
-  `/content_only_launcher` returns 200, `code`/`state` are read
-  correctly.
-- The request to exchange `code → access_token` **never reaches the
-  server** (not visible in server logs or in Wireshark).
-- Hypotheses: (a) Wireshark isn't capturing loopback traffic without
-  special Npcap configuration; (b) a `state` or other validation check
-  fails before the request is ever sent, and the code bails out earlier.
-
-**Next step:** Process Monitor filtered on `Launcher.exe` and `TCP*`
-operations, to determine whether a `connect()` is even attempted after
-the login window closes.
-
-# ZNetwork Proxy
+# New ZNetwork.dll
 
 DLL injection method.
 Install Visual Studio (the Community Edition is free) with the Desktop development with C++ workload. Make sure the x86 (Win32) target is installed—not just x64.
 Open the "x86 Native Tools Command Prompt for VS 2022" (search for it in the Start menu). Be sure to use the x86 prompt, not x64 or x64_x86.
 
-## Navigate to the folder containing the files:
-
-```
-cd C:\path\to\znetwork_proxy
-```
-
 ## Compile the DLL:
-```
-cl /LD /MT znetwork_proxy.cpp /link /DEF:znetwork_proxy.def /OUT:ZNetwork.dll
-```
 
-This method allows you to log all calls made within ZNetwork.dll and may help you implement your own protocol, bypassing the original ProduNet protocol.
+Open "x86 Native Tools Command Prompt for VS 2022"
+
+```
+cd C:\path\to\root\ZNetwork_new
+build.bat
+```
 
 # EXE/DLL Tree
 

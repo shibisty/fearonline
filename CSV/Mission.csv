@@ -1,1 +1,6 @@
 MissionIndex,OpenFactor,SlotIndex,IconInfo,AbleToMode,AbleToSubMode,MapInfo,DiffType,ActionType,ActionCount,Description,Summary,RewardItemIndex1,RewardItemIndex2,RewardItemIndex3
+1,0,0,0,1,0,1,1,1,10,Complete 10 kills,10 kills,0,0,0
+2,0,0,0,1,0,1,2,1,20,Complete 20 kills,20 kills,0,0,0
+3,0,0,0,2,0,2,1,1,5,Complete 5 kills in Scenario,5 kills in Scenario,0,0,0
+4,0,0,0,2,0,2,2,1,10,Complete 10 kills in Scenario,10 kills in Scenario,0,0,0
+5,0,0,0,3,0,3,1,1,15,Complete 15 kills in FireStorm,15 kills in FireStorm,0,0,0
