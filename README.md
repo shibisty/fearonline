@@ -26,7 +26,7 @@ a private server.
 
 ## New Launcher (In progress)
 
-![Screenshot](examples/image_1.png)
+![Screenshot](_examples/image_1.png)
 
 ## Game Patcher
 
@@ -58,12 +58,12 @@ build.bat
 
 **Important:** Run the patcher as Administrator for memory write operations to succeed.
 
-![Screenshot](examples/image_2.png)
+![Screenshot](_examples/image_2.png)
 
 Login: Player
 Password: 1234567890
 
-![Screenshot](examples/image_3.png)
+![Screenshot](_examples/image_3.png)
 
 ### GameClient.dll Global Variables
 
