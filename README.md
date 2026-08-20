@@ -62,6 +62,11 @@ build.bat
 
 ![Screenshot](examples/image_2.png)
 
+Login: Player
+Password: 1234567890
+
+![Screenshot](examples/image_3.png)
+
 ### GameClient.dll Global Variables
 
 The patcher modifies the following global variables in `GameClient.dll`:

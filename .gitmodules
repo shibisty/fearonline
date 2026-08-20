@@ -1,3 +1,6 @@
 [submodule "XignCodeBypass"]
 	path = XignCodeBypass
 	url = https://github.com/Huan912/XignCodeBypass.git
+[submodule "rw-file-detector"]
+	path = rw-file-detector
+	url = https://github.com/shibisty/rw-file-detector.git
