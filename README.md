@@ -17,8 +17,6 @@ a private server.
 | Tool | Purpose |
 |---|---|
 | [**DebugView**](https://learn.microsoft.com/ru-ru/sysinternals/downloads/debugview) | Launcher debug messages, used to locate spots inside `Launcher.exe` via strings |
-| [**TCPView**](https://learn.microsoft.com/ru-ru/sysinternals/downloads/tcpview) | Outgoing requests from a specific process (`Engine.exe`, `Launcher.exe`) |
-| [**Process Monitor**](https://learn.microsoft.com/ru-ru/sysinternals/downloads/procmon) | General process/file/registry activity monitor |
 | [**Wireshark**](https://www.wireshark.org/) | Deeper inspection of outgoing requests |
 | [**Ghidra**](https://github.com/NationalSecurityAgency/ghidra/releases) | String search, disassembly, and decompilation of functions |
 | [**x32dbg**](https://x64dbg.com/) | Step-by-step debugging, breakpoints, call stack, memory values, DLL load log and function call tracing |
