@@ -15,4 +15,5 @@ public/LivePatch/Launcher/*
 trash
 *.dll
 *.exe
+*.obj
 venv
