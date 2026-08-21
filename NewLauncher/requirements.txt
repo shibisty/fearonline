@@ -1,0 +1,3 @@
+PyQt5==5.15.10
+PyQtWebEngine==5.15.6
+pyinstaller==6.6.0

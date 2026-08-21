@@ -1,0 +1,35 @@
+{
+    "window_title": "Лаунчер F.E.A.R. Online (dev)",
+    "title_bar": "F.E.A.R. ONLINE  —  ЛАУНЧЕР (dev)",
+    "settings_tooltip": "Налаштування",
+    "nav_back_tooltip": "Назад",
+    "nav_forward_tooltip": "Вперед",
+
+    "status_mode_label": "Режим",
+    "status_language_label": "Мова",
+    "status_zoom_label": "Масштаб",
+    "mode_windowed": "Віконний",
+    "mode_fullscreen": "Повноекранний",
+    "lang_name_eng": "English",
+    "lang_name_ua": "Українська",
+
+    "start_button": "СТАРТ",
+
+    "settings_title": "НАЛАШТУВАННЯ",
+    "section_display_mode": "РЕЖИМ ЕКРАНУ (ГРА)",
+    "section_language": "МОВА ЛАУНЧЕРА",
+    "windowed_no_default": "Ні (Повноекранний) — за замовчуванням",
+    "windowed_yes": "Так (Віконний)",
+    "lang_option_eng_default": "English — default",
+    "lang_option_ua": "Українська",
+    "btn_cancel": "СКАСУВАТИ",
+    "btn_save": "ЗБЕРЕГТИ",
+
+    "err_unsupported_platform_title": "Непідтримувана платформа",
+    "err_unsupported_platform_text": "Запуск гри підтримується лише на Windows.",
+    "err_engine_not_found_title": "Engine.exe не знайдено",
+    "err_engine_not_found_text": "Не вдалося знайти файл:\n{path}\n\nПеревірте шлях встановлення гри.",
+    "err_failed_start_title": "Не вдалося запустити",
+    "err_failed_start_text": "Не вдалося запустити процес:\n{error}",
+    "err_index_not_found": "index.html не знайдено"
+}

@@ -1,0 +1,35 @@
+{
+    "window_title": "F.E.A.R. Online Launcher (dev)",
+    "title_bar": "F.E.A.R. ONLINE  —  LAUNCHER (dev)",
+    "settings_tooltip": "Settings",
+    "nav_back_tooltip": "Back",
+    "nav_forward_tooltip": "Forward",
+
+    "status_mode_label": "Mode",
+    "status_language_label": "Language",
+    "status_zoom_label": "Zoom",
+    "mode_windowed": "Windowed",
+    "mode_fullscreen": "Fullscreen",
+    "lang_name_eng": "English",
+    "lang_name_ua": "Українська",
+
+    "start_button": "START",
+
+    "settings_title": "SETTINGS",
+    "section_display_mode": "GAME DISPLAY MODE",
+    "section_language": "LAUNCHER LANGUAGE",
+    "windowed_no_default": "No (Fullscreen) — default",
+    "windowed_yes": "Yes (Windowed)",
+    "lang_option_eng_default": "English — default",
+    "lang_option_ua": "Українська",
+    "btn_cancel": "CANCEL",
+    "btn_save": "SAVE",
+
+    "err_unsupported_platform_title": "Unsupported platform",
+    "err_unsupported_platform_text": "Launching the game is only supported on Windows.",
+    "err_engine_not_found_title": "Engine.exe not found",
+    "err_engine_not_found_text": "Could not find file:\n{path}\n\nCheck your game installation path.",
+    "err_failed_start_title": "Failed to start",
+    "err_failed_start_text": "Failed to start the process:\n{error}",
+    "err_index_not_found": "index.html not found"
+}

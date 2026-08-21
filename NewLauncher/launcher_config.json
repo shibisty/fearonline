@@ -1,0 +1,14 @@
+{
+    "windowed": true,
+    "language": "eng",
+    "engine_path": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\FEAR Online\\FEAR_Online\\Engine.exe",
+    "working_directory": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\FEAR Online\\FEAR_Online",
+    "uid": "test123",
+    "launcher_id": "1",
+    "login_server_ip": "127.0.0.1",
+    "login_server_port": "30003",
+    "window_width": 1336,
+    "window_height": 972,
+    "zoom_factor": 1.4,
+    "display_url": "https://address.com"
+}

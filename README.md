@@ -1,4 +1,4 @@
-![Screenshot](public/assets/images/logo.jpg)
+![Screenshot](assets/images/logo.jpg)
 
 # F.E.A.R. Online — Reverse Engineering Notes
 ## Status: Not working yet.
@@ -16,11 +16,11 @@ a private server.
 
 | Tool | Purpose |
 |---|---|
-| [**DebugView**](https://learn.microsoft.com/ru-ru/sysinternals/downloads/debugview) | Launcher debug messages, used to locate spots inside `Launcher.exe` via strings |
+| [**DebugView**](https://learn.microsoft.com/ru-ru/sysinternals/downloads/debugview) | New ZNetwork.dll debug |
 | [**Wireshark**](https://www.wireshark.org/) | Deeper inspection of outgoing requests |
 | [**Ghidra**](https://github.com/NationalSecurityAgency/ghidra/releases) | String search, disassembly, and decompilation of functions |
 | [**x32dbg**](https://x64dbg.com/) | Step-by-step debugging, breakpoints, call stack, memory values, DLL load log and function call tracing |
-| **Python custom server** | Intercepting launcher requests and generating responses |
+| **Python** | Log Server and Launcher |
 
 ---
 
@@ -28,40 +28,11 @@ a private server.
 
 ![Screenshot](_examples/image_1.png)
 
-## Game Patcher
-
-**Experimental memory patcher for FEAR Online**
-
-### 1. Configure paths
-
-Open `GamePatcher.cpp` and verify the following paths match your FEAR Online installation:
-
-```cpp
-std::string enginePath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\FEAR Online\\FEAR_Online\\Engine.exe";
-std::string workingDirectory = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\FEAR Online\\FEAR_Online";
-```
-
-### 2. Compile
-
-Open **"x86 Native Tools Command Prompt for VS 2022"** from the Start menu, then run:
-
-```bash
-cd C:\path\to\GameClient_patcher
-build.bat
-```
-
-### 3. Run
-
-```bash
-.\GamePatcher.exe
-```
-
-**Important:** Run the patcher as Administrator for memory write operations to succeed.
 
 ![Screenshot](_examples/image_2.png)
 
-Login: Player
-Password: 1234567890
+| Login: Player |
+| Password: 1234567890 |
 
 ![Screenshot](_examples/image_3.png)
 
@@ -138,12 +109,6 @@ command-line validation check inside `GameClient.dll`).
 | `Lan` | Localization/language code. Set to `en`. |
 | `LoginServerIP` | Login server IP address. |
 | `LoginServerPort` | Login server port. Default/tested value: `30003`. |
-
-Not included in the tested command line (added only conditionally by
-`Launcher.exe`, see below):
-- `nVersionType 1` — added only if a certain internal config flag is set.
-- `OnSteam 1` / `SteamID <value>` — added only if the Steam gate check
-  passes (see "Open question: user identification" below).
 
 ### Parameter validation order at startup
 
