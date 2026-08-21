@@ -16,4 +16,6 @@ trash
 *.dll
 *.exe
 *.obj
+*.exp
+*.lib
 venv
