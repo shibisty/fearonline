@@ -8,14 +8,26 @@
 #include <windows.h>
 #include <psapi.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstring>
+#include <cwchar>
 #include <cstdint>
 #include <map>
 #include <string>
 #include <exception>
+#include <intrin.h>
 
 #pragma comment(lib, "psapi.lib")
+
+// The crash dumper intentionally probes arbitrary addresses under SEH. Keep
+// those probes outside ASan instrumentation so ASan doesn't abort before the
+// hardware access violation can be contained by __try/__except.
+#if defined(NEWZ_ASAN_BUILD)
+#define ASAN_NO_INSTRUMENT __declspec(no_sanitize_address)
+#else
+#define ASAN_NO_INSTRUMENT
+#endif
 
 // ============ Logging ============
 // Path to the log file -- next to the project, for easy copying of contents
@@ -24,17 +36,40 @@
 static const char* LOG_FILE_PATH = "C:\\fearonline\\znetwork_proxy_log.txt";
 static FILE* g_LogFile = nullptr;
 static bool g_LogFileInitTried = false;
+static volatile LONG g_LogLinesSinceFlush = 0;
+// Updated at dispatcher entry so an exception that happens after a command's
+// own log entry was throttled still carries the last command in the crash log.
+static char g_LastDispatchName[65] = "<none>";
+static uint32_t g_LastDispatchParams[3] = { 0, 0, 0 };
+static volatile LONG g_CallbackTraceSequence = 0;
+static volatile LONG g_LastCallbackSequence = 0;
+static volatile LONG g_LastCallbackReturnedSequence = 0;
+static const char* volatile g_LastCallbackName = "<none>";
+static void* volatile g_LastCallbackTarget = nullptr;
+static const void* volatile g_LastCallbackData = nullptr;
+// Room-create is requested from inside the UI command dispatcher. Defer the
+// synthetic server response until Tick() so the room callbacks are not
+// re-entered while the Host Game command is still on the stack.
+static volatile LONG g_RoomEntryPending = 0;
+static volatile LONG g_RoomEntered = 0;
+// GAME_LOAD_COMPLETE answer to Send_GAME_START_PRE_COMPLETE, delivered from Tick()
+// (see Send_GAME_START_PRE_COMPLETE below).
+static volatile LONG g_GameLoadCompletePending = 0;
+static volatile LONG g_GameLoadCompleteSent = 0;
+static volatile DWORD g_LastTickMs = 0;   // Tick() heartbeat -- is the engine still ticking us?
+static volatile LONG g_BeginRoundPending = 0;   // Send_HOST_GAME_BEGIN_ROUND -> HOST_GAME_BEGIN_ROUND answer
+static volatile LONG g_BeginRoundCount = 0;
 
 static void EnsureLogFileOpen() {
     if (g_LogFileInitTried) return;
     g_LogFileInitTried = true;
-    fopen_s(&g_LogFile, LOG_FILE_PATH, "w");  // "w" = overwrite from scratch
-    // Regular buffering (not _IONBF) -- frequent fflush after each line
-    // added noticeable synchronous disk I/O before each callback call,
-    // which could shift thread timing enough to manifest a race condition
-    // unrelated to the main investigation (see the single crash at address 0x00000000).
-    // fflush is now called only explicitly, in crash diagnostics (DumpCrashDiagnostics),
-    // where it really matters -- not on every ordinary log line.
+    // 2026-11-03: _fsopen with _SH_DENYWR instead of fopen_s -- fopen_s opens
+    // "w" files in exclusive mode (_SH_DENYRW), which made the log
+    // unreadable from outside while the game was sitting on the loading
+    // screen ("Permission denied" even for a copy). Deny only writers.
+    g_LogFile = _fsopen(LOG_FILE_PATH, "w", _SH_DENYWR);  // "w" = overwrite from scratch
+    // Ordinary writes are buffered; Log() flushes in batches and crash
+    // diagnostics force a flush when immediate persistence matters.
 }
 
 static void Log(const char* fmt, ...) {
@@ -43,20 +78,37 @@ static void Log(const char* fmt, ...) {
     va_start(ap, fmt);
     _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
     va_end(ap);
+    // Keep diagnostics in the file only. OutputDebugStringA generates the
+    // DBG_PRINTEXCEPTION_C path on this host; Windows Error Reporting recorded
+    // that code as Engine.exe's fatal exception during the latest runs, which
+    // obscures the real failure and may interact badly with our first-chance
+    // exception handler. Define NEWZ_OUTPUT_DEBUG_STRING explicitly only when
+    // a debugger trace is needed.
+#if defined(NEWZ_OUTPUT_DEBUG_STRING)
     OutputDebugStringA(buf);
     OutputDebugStringA("\n");
+#endif
 
     EnsureLogFileOpen();
     if (g_LogFile) {
         fputs(buf, g_LogFile);
         fputc('\n', g_LogFile);
+        // 2026-11-03: flush EVERY line again. The 64-line batching (added in
+        // October to avoid synchronous I/O on hot UI paths) cost us the
+        // whole crash context in the first run of this build: the process
+        // died hard and the last <64 lines -- including whatever the VEH
+        // managed to write -- never reached the disk. A crash log that
+        // stops before the crash is worth nothing; the I/O cost is
+        // irrelevant for a diagnostic build.
+        InterlockedExchange(&g_LogLinesSinceFlush, 0);
+        fflush(g_LogFile);
     }
 }
 
 // Safe reading of one byte via __try/__except -- used both in the dispatcher hook
 // (command name check) and in crash diagnostics. More reliable than obsolete
 // IsBadReadPtr/IsBadStringPtr* (see comment later in the file).
-static bool SafeReadByte(const uint8_t* p, uint8_t* out) {
+ASAN_NO_INSTRUMENT static bool SafeReadByte(const uint8_t* p, uint8_t* out) {
     __try {
         *out = *p;
         return true;
@@ -64,6 +116,25 @@ static bool SafeReadByte(const uint8_t* p, uint8_t* out) {
         return false;
     }
 }
+
+// Forward declarations -- real definitions are with the rest of the crash
+// diagnostics helpers further down (they reuse SafeReadByte the same way),
+// but HookedDispatcher (below, defined earlier in the file) needs them too,
+// to log the command name string on every dispatch, not just on crash.
+static void TryLogString(const char* label, const void* ptr);
+// Same safe byte-by-byte read as TryLogString, but returns the string into a
+// caller buffer instead of logging it directly -- used by HookedDispatcher to
+// dedupe repeated command names (see there) before deciding whether to log.
+static bool TryGetString(const void* ptr, char* outBuf, size_t outBufSize);
+// The local-map fallback is defined with the room/game exports below. The
+// UI command dispatcher is the only reliable place to catch RoomGameStart if
+// the game's network wrapper does not reach Send_ROOM_GAME_START itself.
+static void EnsureLocalMapStart(const char* source);
+// Engine console-print capture (defined with the game-start code below);
+// Tick() retries it until g_pLTClient exists.
+static void TryInstallLTClientCPrintHook();
+static void DeliverPendingGameLoadComplete();
+static void DeliverPendingBeginRound();
 
 // ============ Structures ============
 #pragma pack(push, 1)
@@ -150,6 +221,56 @@ struct LobbyRoomInfo {
     char     password[16];
 };
 
+// The client registers a callback for this (Set_On_LOBBY_ALL_MODE_MAP_Callback
+// fires at login), but nothing in this proxy ever called it -- we only found
+// out it mattered after "HOST GAME" kept saying "Map does not exist" (36001007)
+// even once the local CSV/g_FakeRooms both agreed on mapId 518. The reference
+// project's real ProudNet server (lobby.go: openMapList(), RMI 0x8D2B) sends
+// this list right after answering the lobby-join request as a varint count
+// followed by (uint16 mapIndex, uint8 isOpen) pairs ON THE WIRE.
+//
+// 2026-09-11: found ZNetwork.dll's OWN decompiled deserializer for this exact
+// RMI (0x8d2b, internally named "NotifyOpenMapList", array element type
+// `Common::Standard::Room::OpenMap`). Its per-element unpack code
+// (FUN_10087c90 in decompiled_znetwork.c) does:
+//     local_18 = Common::Standard::Room::OpenMap::vftable;   // offset 0: vtable ptr
+//     local_14 = CONCAT13(..., *(undefined3*)(param_3 + 4)); // offset 4: uint16 mapIndex + uint8 isOpen
+// i.e. the *native* object ZNetwork.dll builds (and presumably what it hands
+// to whatever calls the registered callback) has a 4-byte field BEFORE
+// mapIndex/isOpen, not just the two payload fields back-to-back at offset 0.
+// That would explain why the first attempt (bare uint16+uint8 at offset 0,
+// no leading 4 bytes) had no effect: whoever reads this data would read the
+// leading 4 bytes of OUR struct as mapIndex/isOpen, not our real fields.
+// This is a strong lead but still a guess about the callback boundary
+// specifically -- we only confirmed the shape for ZNetwork's *internal*
+// wire-deserialization object, not 100% for what it hands across the
+// Set_On_LOBBY_ALL_MODE_MAP_Callback/Set_On_ROOM_OPEN_MAP_INFO_Callback
+// boundary specifically (that would need finding GameClient.dll's own
+// registered handler function, not yet located). Trying it because it's the
+// best-supported theory so far and cheap to test. If "still no change",
+// next step is finding that handler function via x32dbg or further
+// decompile search, not another blind struct guess.
+// 2026-09-11 REVERTED: the {uint32 header=0; uint16 mapIndex; uint8 isOpen}
+// version below caused a reproducible crash right after login (log showed
+// LOBBY_ALL_MODE_MAP/LOBBY_MODE_MAP/ROOM_EVENT_MAP_INFO all "returned"
+// cleanly, then "LOGIN COMPLETE - FAKE SUCCESS", then nothing -- no further
+// dispatch lines at all, meaning the crash happened just after login, most
+// likely when GameClient.dll's UI code later reads back the stored array
+// and dereferences offset 0 as a vtable pointer (matching the theory in the
+// diary) -- except we filled it with 0, which is a guaranteed null-deref if
+// that's really what happens. That's actually evidence FOR the theory (a
+// wrong-but-plausible vtable slot crashes when used; a merely-differently-
+// shaped-but-inert struct wouldn't crash this specifically, this cleanly,
+// this late). But we don't have a real vtable address to put there, so
+// reverting to the known-crash-free layout until that can be found (e.g. by
+// locating GameClient.dll's actual registered handler function, not just
+// ZNetwork.dll's internal wire deserializer). See diary "продолжение 11"
+// and the follow-up entry for this crash.
+struct LobbyModeMapInfo {
+    uint32_t mapIndex;
+    uint32_t isOpen;
+};
+
 // Simplified structure for ITEM_INFO
 struct ItemInfo {
     uint32_t itemId;
@@ -174,7 +295,39 @@ struct ItemInfo {
 // and overlay the small structure at its beginning -- the existing code
 // reading/writing fields by name (g_ServerData.xxx) continues to work as is.
 static uint8_t g_ServerDataBuffer[65536] = { 0 };
+
+// Open-map index whitelist -- see the +0x2690/+0x2694 comment in
+// InitFakeServerDataOnce() below. File-scope (not function-local) so both
+// InitFakeServerDataOnce() and the Tick() re-assertion can point into it.
+static uint16_t g_OpenMapIndices[] = { 518 /* TAM_Killhouse */ };
 static ServerData& g_ServerData = *reinterpret_cast<ServerData*>(g_ServerDataBuffer);
+
+// 2026-09-11 (продолжение 18): placeholder string used to fill unmapped
+// team/user-slot record fields (see the +0x48C comment below) with a
+// valid, non-null pointer instead of leaving them 0 -- see that comment
+// for why. Always valid for the process lifetime (static storage).
+static const char g_FakeUserPlaceholderText[] = "Host";
+
+// 2026-11-03: fills slot 0 of the 20-entry room user list at
+// GetServerData()+0x48C with the layout written by the ORIGINAL
+// ZNetwork.dll (decompiled_znetwork.c FUN_10088290) -- see the comment in
+// InitFakeServerDataOnce(). One record for "me": index 1, team 1, level 10,
+// nickname "Host", no clan. Idempotent; called from init and every Tick().
+static void WriteFakeRoomUserRecord() {
+    uint8_t* rec = g_ServerDataBuffer + 0x48C;
+    memset(rec, 0, 0x74);
+    *reinterpret_cast<int32_t*>(rec + 0x00) = 1;     // user index (== ServerData+0x000)
+    *reinterpret_cast<uint8_t*>(rec + 0x04) = 1;     // occupied
+    *reinterpret_cast<int32_t*>(rec + 0x08) = 0;     // state (switch default)
+    *reinterpret_cast<int32_t*>(rec + 0x0C) = 0;     // 2 would mean "left"
+    *reinterpret_cast<int32_t*>(rec + 0x10) = 1;     // team 1
+    *reinterpret_cast<int32_t*>(rec + 0x14) = 10;    // byte arg of the writer (level/character)
+    wcscpy_s(reinterpret_cast<wchar_t*>(rec + 0x18), 16, L"Host");   // inline wide nickname
+    // +0x38..+0x44: four clan-mark ints = 0; +0x48: inline wide clan name = L""
+    *reinterpret_cast<wchar_t*>(rec + 0x48) = L'\0';
+    *reinterpret_cast<uint8_t*>(rec + 0x70) = 0;     // trailing byte flag (ready?)
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x3C) = 1;   // my team (writer: sd+0x3C when index == *sd)
+}
 
 static uint8_t g_ServerHostDataBuffer[65536] = { 0 };
 static ServerHostData& g_ServerHostData = *reinterpret_cast<ServerHostData*>(g_ServerHostDataBuffer);
@@ -231,6 +384,172 @@ static void InitFakeServerDataOnce() {
     *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e0) = &g_FakeChannels44[0];
     *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e4) = &g_FakeChannels44[0] + 1;
 
+    // 2026-09-11: "open map index" vector, begin/end at +0x2690/+0x2694 of
+    // this SAME GetServerData() buffer -- confirmed by decompile, not a
+    // guess. GameClient.dll's FUN_10079270 (builds the HOST GAME map table
+    // from MapInfo.csv) computes each row's IsOpenMap by calling
+    // FUN_10073e30(mapIndex), which does:
+    //     thunk_FUN_103505f0();               // ensure network iface exists
+    //     iVar2 = thunk_FUN_1034ef00();        // calls GetServerData() (see
+    //                                          // FUN_1034ef00: param_1[7] is
+    //                                          // literally the resolved
+    //                                          // "GetServerData" export,
+    //                                          // called with no args) and
+    //                                          // caches/returns its result
+    //     begin = *(int*)(iVar2 + 0x2690);
+    //     end   = *(int*)(iVar2 + 0x2694);
+    //     count = (end - begin) >> 1;          // uint16 elements
+    //     for i in [0,count): if *(ushort*)(begin + i*2) == mapIndex -> open
+    // This is a completely different (and much safer) path than the
+    // Set_On_LOBBY_ALL_MODE_MAP_Callback / Set_On_ROOM_OPEN_MAP_INFO_Callback
+    // route we spent most of this session on: decompiled BOTH of those
+    // registered handlers (FUN_1034f090, FUN_1034f130) and both are
+    // literally `{ return; }` no-ops in this GameClient.dll build. So no
+    // struct we ever pass to those two callbacks can matter -- this vector,
+    // written directly into memory WE already own and control via
+    // GetServerData(), is the actual mechanism. No stdcall arg-count risk,
+    // no crash risk like the earlier struct experiments.
+    *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2690) = &g_OpenMapIndices[0];
+    *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2694) =
+        &g_OpenMapIndices[0] + (sizeof(g_OpenMapIndices) / sizeof(g_OpenMapIndices[0]));
+
+    // 2026-09-11: "current room" fields, found the same way as the open-map
+    // vector above -- traced thunk_FUN_101a1f60 (called from several places,
+    // looks like the Game Room screen's refresh routine), which does
+    // thunk_FUN_103505f0(); iVar4 = thunk_FUN_1034ef00(); (== GetServerData())
+    // then reads, when *(int*)(iVar4+0x34) != 8 (our buffer defaults that
+    // slot to 0, so we take this branch):
+    //   +0x374 int    -> _global.g_nMonolithPlayerCurRoomIndex
+    //   +0x37c char[] -> _global.g_sMonolithPlayerCurRoomTitle (embedded
+    //                    string, NOT a pointer -- passed as (iVar4+0x37c)
+    //                    itself, room for up to (0x464-0x37c)=0xe8 bytes
+    //                    before the next known field)
+    //   +0x464 int    -> _global.g_nMonolithPlayerCurMapIndex
+    //   +0x468 int    -> _global.g_nMonolithPlayerCurGoalRound (this branch)
+    //   +0x46c int    -> _global.g_nMonolithPlayerCurGoalKill
+    //   +0x474 int    -> _global.g_nMonolithPlayerCurGoalTime
+    // This is presumably why the Game Room screen showed
+    // "[ERROR: Invalid String ID]" for the room title/mode after HOST GAME
+    // finally got past the map-open check: nothing had ever written here.
+    // GoalKill/Round/Time are left at 0 for now -- the visible "100KILL" in
+    // the room UI already renders correctly from a different, already-
+    // working path (the MapInfo.csv-driven map table), so these specific
+    // fields are not proven necessary yet; CurMapIndex is set because it's
+    // the most likely trigger for "which map to actually load" once the
+    // match starts, which is untested territory beyond the room screen.
+    strcpy_s(reinterpret_cast<char*>(g_ServerDataBuffer + 0x37c), 0xe8, "Killhouse Test");
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x374) = 0;    // room index
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x464) = 518;  // mapIndex, TAM_Killhouse
+    // 2026-11-03: the ORIGINAL ZNetwork.dll's room-join deserializer
+    // (decompiled_znetwork.c FUN_10087df0) writes the map index to BOTH
+    // +0x440 and +0x464. +0x440 is the copy the match-start path reads:
+    // GameClient's LoadControlMgr::RequestStartGame (FUN_101a6ba0) does
+    // `mapIndex = *(ServerData+0x440)` -> MapInfo record -> world file, and
+    // CGameClientShell's game-start routine (FUN_10151060) uses it for the
+    // game-mode lookup. Leaving it 0 meant "map 0" at match start.
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x440) = 518;  // mapIndex copy read at match start
+
+    // 2026-09-11: Room team/user-slot list, populated by GameClient.dll's
+    // thunk_FUN_1005a210 (the Game Room screen's per-slot refresh). Confirmed
+    // via decompile: this walks a 20-slot array of 116-byte (0x74) records
+    // starting at this SAME GetServerData() buffer, offset 0x48C (computed
+    // as an int-pointer +0x123 into the buffer, i.e. 0x123*4). Each slot is
+    // only considered occupied if ALL THREE of these record-relative fields
+    // pass:
+    //   rec+0x00 (int)  != 0   -- the record's own user index/id
+    //   rec+0x04 (byte) != 0   -- "occupied" flag
+    //   rec+0x0C (int)  != 2   -- must not be state 2 (left/kicked)
+    // Our buffer is all-zero by default, so every one of the 20 slots fails
+    // this gate -- confirmed to be why every visible team slot showed
+    // "-Unavailable-".
+    //
+    // REVERTED 2026-09-11 (продолжение 17): writing a passing record here
+    // (rec+0x00/+0x04/+0x08=1, +0x0C=0) plus buffer+0x000/+0x44C=1 caused a
+    // reproducible crash right after login -- log stops cleanly immediately
+    // after "LOGIN COMPLETE - FAKE SUCCESS" with zero further DISPATCH
+    // lines, the exact same signature as the earlier LobbyModeMapInfo
+    // vtable-header crash. Root cause theory: this same
+    // MonolithMenuUser*-populating code path is very likely ALSO driven by
+    // the lobby member list (not just the room screen) -- "Monolith Menu"
+    // sounds general-purpose, not room-specific -- so as soon as our record
+    // passes the occupancy gate, thunk_FUN_1005a210's field-processing code
+    // for Name/Level/ClanMark/ClanName/TeamIndex/RoomState (rec+0x10
+    // onward) executes for the very first time ever (previously always
+    // skipped, since no record ever passed the gate against an all-zero
+    // buffer) -- and that code is the part we could NOT reliably map (see
+    // продолжение 16): the real SetVariable "value" arguments for those
+    // fields are buried in SEH-scratch-slot reuse. Something in there is
+    // apparently dereferencing a genuine pointer sourced from our
+    // all-zero record bytes, contradicting the "embedded char array, safe
+    // when zero" hypothesis used to justify leaving them zero.
+    //
+    // Left fully disabled (record and buffer+0x000/+0x44C NOT written, i.e.
+    // back to the known-safe all-zero baseline) until this can be
+    // investigated with an actual debugger (x32dbg) rather than further
+    // decompile guessing -- see продолжение 17 for the plan.
+    //
+    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48C + 0x00) = 1;  // rec+0x00: user index
+    // *reinterpret_cast<uint8_t*>(g_ServerDataBuffer + 0x48C + 0x04) = 1;  // rec+0x04: occupied flag
+    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48C + 0x08) = 1;  // rec+0x08: connection state
+    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48C + 0x0C) = 0;  // rec+0x0C: must != 2
+    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x000) = 1;         // "is me" reference index
+    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x44C) = 1;         // "is host" reference index
+    //
+    // 2026-09-11 (продолжение 18): re-enabled at the user's request, with an
+    // added mitigation for the specific crash theory above. Monolith's own
+    // global-variable naming convention independently confirms field types
+    // for everything this record feeds via SetVariable:
+    //   "_global.g_anMonolithMenuUserIndex"      -- "an" = int   -> rec+0x00
+    //   "_global.g_anMonolithMenuUserLevel"      -- "an" = int
+    //   "_global.g_asMonolithMenuUserName"       -- "as" = STRING
+    //   "_global.g_abMonolithMenuUserIsClan"     -- "ab" = bool  -> rec+0x34 (confirmed)
+    //   "_global.g_anMonolithMenuUserClanMark0/1/2" -- "an" = int
+    //   "_global.g_asMonolithMenuUserClanName"   -- "as" = STRING
+    //   "_global.g_anMonolithMenuUserTeamIndex"  -- "an" = int
+    //   "_global.g_anMonolithMenuUserRoomState"  -- "an" = int
+    // Exactly two fields are strings (Name, ClanName); everything else is a
+    // plain int or bool. We could NOT pin down which of the ~24 still-
+    // unmapped 4-byte slots (rec+0x10..+0x70, skipping the confirmed
+    // rec+0x34 IsClan bool) are those two string fields -- this function is
+    // unusually obscured by SEH-unwind scaffolding, to the point that even
+    // an unconditional late line in the decompile
+    // (`*(int*)(iStack_9c+0x378)`) LOOKS like a near-null dereference but
+    // demonstrably does not crash on every call (every earlier room-screen
+    // refresh with an empty slot table ran it fine), proving Ghidra's
+    // variable tracking is unreliable across large stretches of this
+    // specific function and cannot be trusted for a precise offset-to-field
+    // mapping here without a live debugger.
+    //
+    // Rather than guess a single offset for Name/ClanName, every remaining
+    // unmapped slot is pointed at a short, always-valid static placeholder
+    // string. Reasoning: leaving a real string field as 0 is now CONFIRMED
+    // to crash (продолжение 17). A plain-int field (Level/ClanMark0-2/
+    // TeamIndex/RoomState) that ends up holding a pointer-sized value
+    // instead of a small int is expected to fail softer -- a cosmetically
+    // wrong displayed number, or a clamped/ignored value if the real code
+    // range-checks it (plausible for TeamIndex/RoomState, since in the real
+    // game these fields are populated over the network from other players
+    // and the client must already tolerate bad values there without
+    // crashing). This is an explicit, acknowledged experiment, not a
+    // confirmed-safe mapping -- if it crashes, the plan is a live x32dbg
+    // session rather than a third blind guess.
+    // 2026-11-03: the placeholder-pointer experiment above is SUPERSEDED by
+    // the real record layout, read straight from the ORIGINAL ZNetwork.dll's
+    // room-user-list writer (decompiled_znetwork.c FUN_10088290, called per
+    // user by FUN_10087330 before it fires ROOM_USER_INFO). Record = 0x1d
+    // dwords = 0x74 bytes, 20 slots from +0x48C; strings are INLINE wide
+    // strings (StrCpyW), not pointers -- which is why the "Host" pointer
+    // bytes showed up as garbage names instead of crashing:
+    //   +0x00 int   user index           +0x04 byte occupied(=1)
+    //   +0x08 int   state (switch 2..7)  +0x0C int  =0 (2 = left)
+    //   +0x10 int   team: 1/2/0          +0x14 int  (byte arg: level/char)
+    //   +0x18 wchar nickname[16]         +0x38..+0x44 four ints (clan marks)
+    //   +0x48 wchar clan name            +0x70 byte flag (ready?)
+    // The writer also sets ServerData+0x3C = my team when userIndex == *sd.
+    WriteFakeRoomUserRecord();
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x000) = 1;         // "is me" reference index
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x44C) = 1;         // "is host" reference index
+
     // ---------------------------------------------------------------------
     // Player profile fields -- offsets confirmed by disassembling
     // thunk_FUN_10059580 (Multiplayer.OnSetMyInfo), which reads them
@@ -240,7 +559,7 @@ static void InitFakeServerDataOnce() {
     // right place.
     // ---------------------------------------------------------------------
     *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x38)   = 10;   // MyUserGrade
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x40)   = 100;  // MyLevel
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x40)   = 10;   // MyLevel -- kept in sync with g_FakeUserInfo.level below
     *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48)   = 0;    // purpose not confirmed -- safe 0
     *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x50)   = 0;
     *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x58)   = 0;
@@ -263,19 +582,38 @@ static void InitFakeServerDataOnce() {
     // to read it as a C-string.
     strcpy_s(reinterpret_cast<char*>(g_ServerDataBuffer + 0x1e4c), 64, "TestUser");
 
+    // hostPort 27889 -- the "LithTech" port constant confirmed in the
+    // fear-online-server reference project (proudnet/game_start.go,
+    // lithTechPort). Everything else here stays neutral (not yet hosting)
+    // until Send_ROOM_GAME_START() flips it -- see there for why.
     g_ServerHostData.hostMode = 0;
     g_ServerHostData.hostPlayerId = 0;
     strcpy_s(g_ServerHostData.hostIp, "127.0.0.1");
-    g_ServerHostData.hostPort = 7777;
+    g_ServerHostData.hostPort = 27889;
     g_ServerHostData.isRoomOwner = 0;
 }
 
+// ----------------------------------------------------------------------------
+// Fake profile values below are cross-checked against the fear-online-server
+// reference project (a separate, more complete ProudNet reimplementation --
+// see C:\OSPanel6\home\fear-online-server), specifically:
+//   - server/.env.example: STARTING_POINT=50000, STARTING_CASH=50000
+//   - server/internal/catalog/catalog.go: StarterItems (one A.T.C. character,
+//     one T.F. character, one M16 primary weapon -- these ItemIndex values are
+//     the real ones extracted from the game's own GameItem.csv/.Arch01 data,
+//     not invented) and MapInfo.csv row for TAM_Killhouse (MapIndex 518,
+//     TeamDeathMatch) -- a small, simple map, good for a first "does it load"
+//     test. None of this changes the wire protocol (we still never talk to
+//     that Go server / real ProudNet) -- it only makes the numbers we hand to
+//     GameClient.dll's callbacks resemble real, plausible game data instead of
+//     placeholders like "Item 1"/"Room 1".
+// ----------------------------------------------------------------------------
 static LoginData g_FakeLoginData = {
     0, 1001, 0x12345678, 0, "TestUser", 1, 1
 };
 
 static UserInfo g_FakeUserInfo = {
-    1001, 1, 0, 100, "TestUser", 0, 0, 19508, 0
+    1001, 10, 500, 1000, "TestUser", 0, 0, 50000, 50000
 };
 
 static LoginFailData g_FakeLoginFail = {
@@ -296,19 +634,33 @@ static GateLobbyInfo g_FakeGateLobbyInfo = {
     1, "Lobby 1", 10, 100
 };
 
-static LobbyRoomInfo g_FakeRooms[3] = {
-    {1, "Room 1", 2, 8, 1, 1, 0, ""},
-    {2, "Room 2", 4, 8, 2, 2, 0, ""},
-    {3, "Room 3", 1, 8, 1, 3, 0, ""}
+// A single joinable room advertised at login, pre-filled for TAM_Killhouse
+// (MapIndex 518 in the real MapInfo.csv, TeamDeathMatch mode). "mode"/"mapId"
+// field meaning inside LobbyRoomInfo is our own guess (see struct above) --
+// not confirmed against a real client the way GetServerData()'s offsets are.
+static LobbyRoomInfo g_FakeRooms[1] = {
+    {1, "Killhouse Test", 1, 16, 5 /*TeamDeathMatch*/, 518 /*TAM_Killhouse*/, 0, ""}
 };
 
-// Simplified items
-static ItemInfo g_FakeItems[5] = {
-    {1, "Item 1", 100, 0, 1, 1, 0, 1},
-    {2, "Item 2", 200, 0, 1, 1, 0, 1},
-    {3, "Item 3", 300, 0, 1, 1, 0, 1},
-    {4, "Item 4", 400, 0, 1, 1, 0, 1},
-    {5, "Item 5", 500, 0, 1, 1, 0, 1}
+// "Open map" advertisement -- see LobbyModeMapInfo comment above. Must list
+// the same mapId as g_FakeRooms[0] (518 / TAM_Killhouse) or the client will
+// keep rejecting it as "Map does not exist" when creating a room.
+static LobbyModeMapInfo g_FakeModeMaps[1] = {
+    {518 /*TAM_Killhouse*/, 1 /*isOpen*/}
+};
+
+// Real ItemIndex values from the reference project's extracted catalog
+// (StarterItems in catalog.go): an A.T.C. character, a T.F. character, and an
+// M16 primary weapon -- the minimum kit the real server grants a brand-new
+// account. Using the real indices (rather than placeholder 1..5) means that,
+// if GameClient.dll resolves item names/models by ItemIndex against its own
+// local catalog/archives (it ships the same GameItem data the client reads
+// for shop/inventory display), these should actually resolve to real items
+// instead of "unknown item".
+static ItemInfo g_FakeItems[3] = {
+    {11100101, "A.T.C. Character", 0, 0, 1, 1, 0, 1},
+    {12100101, "T.F. Character",   0, 0, 1, 1, 0, 1},
+    {21102201, "M16",              0, 0, 1, 1, 0, 1}
 };
 
 // ============ PATCHING GLOBAL VARIABLES REMOVED ============
@@ -365,27 +717,219 @@ static uint8_t* g_Trampoline = nullptr;
 typedef void (__stdcall *Dispatcher_t)(int*, uint32_t, uint32_t, uint32_t);
 static Dispatcher_t g_OriginalDispatcher = nullptr;
 
+// ============ Dispatcher fault recovery WITHOUT SEH unwinding (2026-11-03) ============
+// The "Multiplayer.GameServerConnect" dispatch ends in `call [edi]` at
+// Engine.exe 0x00486606 with a register clobbered by the deeply re-entrant
+// login callbacks (every nested DISPATCH line in the log happens INSIDE that
+// first handler call). Sometimes the fault is "nice" (EIP=0x00486631, ESP
+// still inside the stack) and the __except below used to absorb it; this run
+// it jumped to EIP=0 with ESP=0x0034004B, far outside the thread stack. Our
+// VEH correctly declined to probe -- but the OS then tried to SEH-unwind that
+// frame to reach our __except, could not, and raised 0xC0000029
+// (STATUS_INVALID_UNWIND_TARGET) -> fast-fail -> the "hung" process.
+//
+// So we stop depending on unwinding at all. The original dispatcher is now
+// entered through GuardedDispatcherCall (naked asm): it records its own
+// ESP/EBP in a small per-depth table (the dispatcher re-enters itself from
+// nested UI commands, so a single slot is not enough), pushes the four
+// stdcall arguments and calls the trampoline. If ANY access violation is
+// raised while a guarded call is active, the vectored handler simply writes
+// the recorded ESP/EBP back into the thread context, points EIP at
+// DispatcherResumeStub and returns EXCEPTION_CONTINUE_EXECUTION -- the CPU
+// continues as if the original had just returned; nothing is unwound, so a
+// trashed frame can no longer kill the process. DispatcherResumeStub is the
+// exact epilogue of GuardedDispatcherCall (pop edi/esi/ebx/ebp; ret 16).
+static const LONG kDispMaxDepth = 64;
+static DWORD g_DispFrames[kDispMaxDepth * 2];   // [2*i] = esp, [2*i+1] = ebp
+static volatile LONG g_DispDepth = 0;
+static volatile LONG g_DispResumedCount = 0;
+static HMODULE g_hThisModule = nullptr;   // set in DllMain; faults inside our own code are never 'resumed'
+
+__declspec(naked) static void DispatcherResumeStub() {
+    __asm {
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret 16
+    }
+}
+
+__declspec(naked) static void __stdcall GuardedDispatcherCall(int* p1, uint32_t p2, uint32_t p3, uint32_t p4) {
+    __asm {
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        mov eax, g_DispDepth
+        cmp eax, 64                      ; kDispMaxDepth
+        jae no_save
+        mov ecx, eax
+        shl ecx, 3                       ; 8 bytes per entry
+        mov dword ptr g_DispFrames[ecx], esp
+        mov dword ptr g_DispFrames[ecx + 4], ebp
+    no_save:
+        inc dword ptr g_DispDepth
+        push dword ptr [ebp + 20]        ; p4
+        push dword ptr [ebp + 16]        ; p3
+        push dword ptr [ebp + 12]        ; p2
+        push dword ptr [ebp + 8]         ; p1
+        call dword ptr g_OriginalDispatcher   ; stdcall -> callee pops the 4 args
+        dec dword ptr g_DispDepth
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret 16
+    }
+}
+
+// Called from the vectored handler. Returns true if the context was
+// redirected and the handler should return EXCEPTION_CONTINUE_EXECUTION.
+static bool TryResumeGuardedDispatcher(EXCEPTION_POINTERS* ex) {
+    const LONG depth = g_DispDepth;
+    if (depth <= 0 || depth > kDispMaxDepth) return false;
+    CONTEXT* c0 = ex->ContextRecord;
+    // Never hijack the EXPECTED first-chance faults of our own SEH-guarded
+    // memory probes (SafeReadByte/TryGetString/CopyConsoleLine) -- those are
+    // handled by their own __except and happen all the time while a nested
+    // dispatcher call is active.
+    if (g_hThisModule) {
+        MODULEINFO mi = {};
+        if (GetModuleInformation(GetCurrentProcess(), g_hThisModule, &mi, sizeof(mi))) {
+            const uintptr_t lo = (uintptr_t)mi.lpBaseOfDll, hi = lo + mi.SizeOfImage;
+            if (c0->Eip >= lo && c0->Eip < hi) return false;
+        }
+    }
+    // Only the signatures that the OS cannot unwind / the game cannot handle:
+    //   - ESP outside the thread stack (frame trashed),
+    //   - EIP in the dispatcher function itself (its LEAVE/RET epilogue), or
+    //   - EIP in the null page (jumped through a clobbered pointer).
+    // Everything else keeps the old behaviour (CONTINUE_SEARCH -> game's
+    // own SEH, or our __except around the guarded call).
+    const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const uintptr_t stackLo = (uintptr_t)tib->StackLimit, stackHi = (uintptr_t)tib->StackBase;
+    const bool espBad   = (c0->Esp < stackLo || c0->Esp >= stackHi);
+    const bool eipDisp  = (c0->Eip >= HOOK_TARGET_ADDR && c0->Eip < HOOK_TARGET_ADDR + 0x101);  // 0x00486534..0x00486634
+    const bool eipNull  = (c0->Eip < 0x10000);
+    if (!espBad && !eipDisp && !eipNull) return false;
+    const LONG i = depth - 1;
+    CONTEXT* c = ex->ContextRecord;
+    const DWORD faultEip = c->Eip, faultEsp = c->Esp, faultEbp = c->Ebp;
+    c->Esp = g_DispFrames[2 * i];
+    c->Ebp = g_DispFrames[2 * i + 1];
+    c->Eip = (DWORD)(uintptr_t)&DispatcherResumeStub;
+    g_DispDepth = i;
+    const LONG n = InterlockedIncrement(&g_DispResumedCount);
+    if (n <= 20) {
+        Log("[Proxy] HOOK: dispatcher fault (EIP=0x%08X ESP=0x%08X EBP=0x%08X, depth %ld, last cmd \"%s\") -> context repaired to ESP=0x%08X EBP=0x%08X, resuming past the dispatcher (occurrence %ld)",
+            faultEip, faultEsp, faultEbp, depth, g_LastDispatchName, c->Esp, c->Ebp, n);
+    }
+    return true;
+}
+
 static void __stdcall HookedDispatcher(int* param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
     if (!g_OriginalDispatcher) return;
 
+    // DIY debug tracing instead of an interactive x32dbg session: this
+    // dispatcher is the COMMON path for every UI command (see the big
+    // comment above), so logging every call through it -- not just the ones
+    // that happen to crash afterwards -- is our own "logging breakpoint" on
+    // every command the UI fires. In particular, this should let us see
+    // whatever command name fires when HOST GAME is clicked and rejected
+    // with "36001007 Map does not exist" (a validation that apparently
+    // never crashes and never reaches any of our Send_* exports, so it was
+    // completely invisible to us until now). param_2 is (per the crash-absorb
+    // branch below, which already assumed this) a command-name string
+    // pointer -- confirmed true in practice: "Global.OnConstruct",
+    // "MultiplayerHost.OnConstruct", etc.
+    //
+    // First attempt at this (flat cap at 300 total calls) burned its whole
+    // budget on a UI screen that repeatedly queries
+    // "KeyBindings.GetButtonForCommand"/"GetButtonNameForCommand" in a loop
+    // (one pair per bindable action) long before the user ever reached HOST
+    // GAME -- so we never even saw it. Fix: dedupe PER COMMAND NAME instead
+    // of a single global counter -- log the first few occurrences of each
+    // distinct name in full, then go quiet for that name specifically (a
+    // repeating command like the keybindings query stops flooding the log
+    // after its first few hits, while a rare, one-off command fired only
+    // once -- like whatever HOST GAME triggers -- always gets logged).
+    // Small fixed-size table (no STL container here, to keep this __try/SEH
+    // function as close to the codebase's existing low-level style as
+    // possible) -- linear scan is fine at this size and call rate.
+    struct DispatchNameCount { char name[65]; int count; };
+    static DispatchNameCount seenNames[256];
+    static int seenNamesCount = 0;
+    static int unnamedLoggedCount = 0;  // param_2 didn't look like a string
+    const int kLogPerNameLimit = 3;
+
+    char nameBuf[65];
+    bool haveName = TryGetString((const void*)(uintptr_t)param_2, nameBuf, sizeof(nameBuf));
+    if (haveName) {
+        strcpy_s(g_LastDispatchName, nameBuf);
+    } else {
+        strcpy_s(g_LastDispatchName, "<unreadable>");
+    }
+    g_LastDispatchParams[0] = param_2;
+    g_LastDispatchParams[1] = param_3;
+    g_LastDispatchParams[2] = param_4;
+
+    if (haveName) {
+        int idx = -1;
+        for (int i = 0; i < seenNamesCount; i++) {
+            if (strcmp(seenNames[i].name, nameBuf) == 0) { idx = i; break; }
+        }
+        if (idx < 0 && seenNamesCount < 256) {
+            idx = seenNamesCount++;
+            strcpy_s(seenNames[idx].name, nameBuf);
+            seenNames[idx].count = 0;
+        }
+        if (idx >= 0) {
+            seenNames[idx].count++;
+            if (seenNames[idx].count <= kLogPerNameLimit) {
+                Log("[Proxy] DISPATCH \"%s\" (occurrence %d for this name): param_1=0x%p param_3=0x%08X param_4=0x%08X",
+                    nameBuf, seenNames[idx].count, (void*)param_1, param_3, param_4);
+            } else if (seenNames[idx].count == kLogPerNameLimit + 1) {
+                Log("[Proxy] DISPATCH \"%s\": further occurrences of this specific name silenced", nameBuf);
+            }
+        }
+        // Table full (256 distinct names) -- fall through silently for any
+        // further brand-new names; everything already tracked keeps working.
+    } else if (unnamedLoggedCount < 20) {
+        unnamedLoggedCount++;
+        Log("[Proxy] DISPATCH (param_2 not a readable string, occurrence %d): param_1=0x%p param_2=0x%08X param_3=0x%08X param_4=0x%08X",
+            unnamedLoggedCount, (void*)param_1, param_2, param_3, param_4);
+    }
+
+    // Execute the ORIGINAL function in full -- including the real command
+    // handler call (the first call, which is what performs our login for
+    // "Multiplayer.GameServerConnect"). Faults inside it are recovered by the
+    // vectored handler through GuardedDispatcherCall's recorded frame -- see
+    // the comment above that function. (This used to be a __try/__except;
+    // that only works while the OS can still unwind the faulting frame.)
+    const LONG depthAtEntry = g_DispDepth;
     __try {
-        // Execute the ORIGINAL function in full -- including the real command
-        // handler call (the first call). If it reaches the crash in the epilogue
-        // (LEAVE with corrupted EBP) -- we'll catch it below, without losing
-        // the useful work already performed.
-        g_OriginalDispatcher(param_1, param_2, param_3, param_4);
+        GuardedDispatcherCall(param_1, param_2, param_3, param_4);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Absorb the epilogue crash -- the real command logic has already executed
-        // (the first call succeeded), the function just couldn't return normally
-        // due to corrupted EBP. Log throttled to avoid flooding the log on
-        // frequent triggers.
+        // Ordinary (unwindable) fault that nobody below us handled -- same
+        // absorb-and-continue as before. The guarded call never reached its
+        // `dec g_DispDepth`, so restore the depth we entered with.
+        g_DispDepth = depthAtEntry;
         static int loggedCount = 0;
         if (loggedCount < 5) {
             loggedCount++;
-            const char* cmdName = (const char*)param_2;
-            Log("[Proxy] HOOK: absorbed dispatcher crash for command (occurrence %d, param_2=0x%08X)",
-                loggedCount, param_2);
+            Log("[Proxy] HOOK: absorbed dispatcher fault via __except (occurrence %d, cmd \"%s\")",
+                loggedCount, haveName ? nameBuf : "<unreadable>");
         }
+    }
+
+    // RoomCreate only prepares the lobby. The trace showed that starting the
+    // world here queues a transition too early, before the user starts the
+    // match; this then suppresses the real Start Game event. Only allow the
+    // fallback after the actual RoomGameStart command.
+    if (haveName && strcmp(nameBuf, "Multiplayer.RoomGameStart") == 0) {
+        EnsureLocalMapStart("Multiplayer.RoomGameStart dispatcher fallback");
     }
 }
 
@@ -453,6 +997,51 @@ static void* GetCallback(const char* name) {
     return (it != g_Callbacks.end()) ? it->second : nullptr;
 }
 
+// Emit one durable, correlated record immediately before each indirect call
+// into GameClient.dll. The sequence and last-call fields are also included in
+// exception logs so the failing callback is still identifiable if output
+// around the fault is truncated.
+static LONG LogCallbackBegin(const char* name, void* callback, const void* data,
+                             uint32_t arg2, uint32_t arg3, uintptr_t caller) {
+    const LONG sequence = InterlockedIncrement(&g_CallbackTraceSequence);
+    char modulePath[MAX_PATH] = "<unmapped>";
+    HMODULE module = nullptr;
+    if (callback && GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(callback), &module)) {
+        const DWORD length = GetModuleFileNameA(module, modulePath, MAX_PATH);
+        if (length == 0) strcpy_s(modulePath, "<path unavailable>");
+    }
+
+    g_LastCallbackName = name;
+    g_LastCallbackTarget = callback;
+    g_LastCallbackData = data;
+    InterlockedExchange(&g_LastCallbackSequence, sequence);
+    Log("[Proxy] CALLBACK #%ld PRE name=\"%s\" target=%p module=\"%s\" data=%p arg2=0x%08X arg3=0x%08X caller=0x%08X tid=%lu tick=%lu",
+        sequence, name, callback, modulePath, data, arg2, arg3,
+        (uint32_t)caller, GetCurrentThreadId(), GetTickCount());
+    return sequence;
+}
+
+static void LogCallbackReturn(LONG sequence, const char* name) {
+    InterlockedExchange(&g_LastCallbackReturnedSequence, sequence);
+    Log("[Proxy] CALLBACK #%ld POST name=\"%s\" result=returned tid=%lu tick=%lu",
+        sequence, name, GetCurrentThreadId(), GetTickCount());
+}
+
+static void LogLastCallbackContext() {
+    const LONG sequence = InterlockedCompareExchange(&g_LastCallbackSequence, 0, 0);
+    const LONG returned = InterlockedCompareExchange(&g_LastCallbackReturnedSequence, 0, 0);
+    if (sequence == 0) {
+        Log("[Proxy] Last callback: none");
+        return;
+    }
+    Log("[Proxy] Last callback #%ld state=%s name=\"%s\" target=%p data=%p",
+        sequence, (sequence == returned) ? "returned" : "entered-not-returned",
+        g_LastCallbackName, g_LastCallbackTarget, g_LastCallbackData);
+}
+
 // Dump raw bytes of a structure we're passing to a callback -- allows
 // comparison with what GameClient.dll actually expects, without guessing.
 static void DumpStructBytes(const char* label, const void* data, size_t size) {
@@ -472,15 +1061,44 @@ static void DumpStructBytes(const char* label, const void* data, size_t size) {
     }
 }
 
+// Like DumpStructBytes, but for pointers we did NOT allocate ourselves --
+// e.g. an argument a Send_* export receives from the client, whose real
+// size we don't actually know. Reads byte-by-byte through SafeReadByte
+// (same helper the crash diagnostics use) so guessing too large a length
+// just gets truncated at the first inaccessible page instead of crashing
+// the process on an out-of-bounds read.
+static void SafeDumpExternal(const char* label, const void* ptr, size_t maxLen) {
+    if (!ptr) { Log("[Proxy]   %s = NULL", label); return; }
+    const uint8_t* p = (const uint8_t*)ptr;
+    char line[128];
+    for (size_t i = 0; i < maxLen; i += 16) {
+        int pos = sprintf_s(line, "[Proxy]   %s+0x%02zX: ", label, i);
+        bool any = false;
+        for (size_t j = 0; j < 16 && i + j < maxLen; j++) {
+            uint8_t b;
+            if (SafeReadByte(p + i + j, &b)) {
+                pos += sprintf_s(line + pos, sizeof(line) - pos, "%02X ", b);
+                any = true;
+            } else {
+                pos += sprintf_s(line + pos, sizeof(line) - pos, "?? ");
+            }
+        }
+        Log("%s", line);
+        if (!any) break;  // ran off the end of whatever was actually mapped
+    }
+}
+
 template<typename T>
 static void CallCallback(const char* name, T* data) {
     void* cb = GetCallback(name);
     if (cb) {
         Log("[Proxy] Calling %s", name);
         DumpStructBytes(name, data, sizeof(T));
+        const LONG traceSequence = LogCallbackBegin(
+            name, cb, data, 0, 0, (uintptr_t)_ReturnAddress());
         typedef void (__stdcall *CallbackFunc)(T*);
         ((CallbackFunc)cb)(data);
-        Log("[Proxy] %s returned", name);
+        LogCallbackReturn(traceSequence, name);
         Sleep(10);
     }
 }
@@ -496,9 +1114,11 @@ static void CallCallback2(const char* name, T* data, int secondArg) {
     if (cb) {
         Log("[Proxy] Calling %s (2-arg, second=%d)", name, secondArg);
         DumpStructBytes(name, data, sizeof(T));
+        const LONG traceSequence = LogCallbackBegin(
+            name, cb, data, (uint32_t)secondArg, 0, (uintptr_t)_ReturnAddress());
         typedef void (__stdcall *CallbackFunc)(T*, int);
         ((CallbackFunc)cb)(data, secondArg);
-        Log("[Proxy] %s returned", name);
+        LogCallbackReturn(traceSequence, name);
         Sleep(10);
     }
 }
@@ -507,9 +1127,11 @@ static void CallCallbackArray(const char* name, void* data, int count) {
     void* cb = GetCallback(name);
     if (cb) {
         Log("[Proxy] Calling %s (count=%d)", name, count);
+        const LONG traceSequence = LogCallbackBegin(
+            name, cb, data, (uint32_t)count, 0, (uintptr_t)_ReturnAddress());
         typedef void (__stdcall *CallbackFunc)(void*, int);
         ((CallbackFunc)cb)(data, count);
-        Log("[Proxy] %s returned", name);
+        LogCallbackReturn(traceSequence, name);
         Sleep(10);
     }
 }
@@ -518,11 +1140,138 @@ static void CallCallbackVoid(const char* name) {
     void* cb = GetCallback(name);
     if (cb) {
         Log("[Proxy] Calling %s", name);
+        const LONG traceSequence = LogCallbackBegin(
+            name, cb, nullptr, 0, 0, (uintptr_t)_ReturnAddress());
         typedef void (__stdcall *CallbackFunc)(void*);
         ((CallbackFunc)cb)(nullptr);
-        Log("[Proxy] %s returned", name);
+        LogCallbackReturn(traceSequence, name);
         Sleep(10);
     }
+}
+
+// These three GameClient callback entry points were inspected in the captured
+// x86 image: their wrapper bodies consult the client's singleton managers and
+// do not read a payload from the caller stack. They are cdecl/no-argument
+// notifications, unlike CallCallbackVoid(), which passes one pointer.
+static bool CallCallbackNotification(const char* name) {
+    void* cb = GetCallback(name);
+    if (!cb) {
+        Log("[Proxy] Room notification %s is not registered", name);
+        return false;
+    }
+    const LONG traceSequence = LogCallbackBegin(
+        name, cb, nullptr, 0, 0, (uintptr_t)_ReturnAddress());
+    bool returned = false;
+    __try {
+        typedef void (__cdecl *CallbackFunc)();
+        ((CallbackFunc)cb)();
+        returned = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[Proxy] Room notification %s raised exception 0x%08lX; continuing guarded sequence",
+            name, GetExceptionCode());
+    }
+    if (returned) LogCallbackReturn(traceSequence, name);
+    return returned;
+}
+
+static void DeliverPendingRoomEntry() {
+    if (InterlockedCompareExchange(&g_RoomEntryPending, 0, 0) == 0 ||
+        InterlockedCompareExchange(&g_RoomEntered, 0, 0) != 0) return;
+
+    // Consume once before dispatch to protect against callback re-entry.
+    InterlockedExchange(&g_RoomEntryPending, 0);
+    InterlockedExchange(&g_RoomEntered, 1);
+    Log("[Proxy] Delivering deferred local room-entry notifications from Tick()");
+    CallCallbackNotification("ROOM_OPEN_MAP_INFO");
+    CallCallbackNotification("ROOM_INFO");
+    CallCallbackNotification("ROOM_JOIN");
+    Log("[Proxy] Deferred room-entry notification sequence finished; no map start was requested");
+}
+
+// GameClient's start callback signature is visible in the forwarding proxy
+// used by fear-online-server: (wide map name, int16 name length, int intrude).
+// Keep this separate from the generic callback helpers so a missing/incorrect
+// payload cannot silently become a null pointer argument.
+static void CallGameStartCallback(const char* name, const wchar_t* mapName,
+                                  short mapNameLength, int intrude) {
+    void* cb = GetCallback(name);
+    if (!cb) {
+        Log("[Proxy] Callback %s is not registered; skipping", name);
+        return;
+    }
+    Log("[Proxy] Calling %s(map=%ls, length=%d, intrude=%d)",
+        name, mapName, (int)mapNameLength, intrude);
+    // The forwarding DLL confirms the three stack arguments, but does not
+    // establish whether GameClient cleans the stack. Restore ESP ourselves so
+    // either cdecl or stdcall cleanup is safe for this experimental callback.
+    uint32_t savedEsp = 0;
+    const int mapNameLengthArg = (int)mapNameLength;
+    const LONG traceSequence = LogCallbackBegin(
+        name, cb, mapName, (uint32_t)mapNameLength, (uint32_t)intrude,
+        (uintptr_t)_ReturnAddress());
+    __try {
+        __asm {
+            mov savedEsp, esp
+            push intrude
+            push mapNameLengthArg
+            push mapName
+            call cb
+            mov esp, savedEsp
+        }
+        LogCallbackReturn(traceSequence, name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        __asm { mov esp, savedEsp }
+        Log("[Proxy] EXCEPTION in CALLBACK #%ld name=\"%s\"; exception absorbed",
+            traceSequence, name);
+    }
+}
+
+// One integer argument, ESP restored by us (callee convention unknown),
+// SEH-wrapped -- for the host-side callbacks registered by the in-process
+// GameServer.dll (e.g. HOST_GAME_USER_LOAD_COMPLETE(userIndex)).
+static void CallCallbackInt1Safe(const char* name, int arg) {
+    void* cb = GetCallback(name);
+    if (!cb) { Log("[Proxy] Callback %s is not registered; skipping", name); return; }
+    Log("[Proxy] Calling %s(%d)", name, arg);
+    uint32_t savedEsp = 0;
+    const LONG traceSequence = LogCallbackBegin(name, cb, nullptr, (uint32_t)arg, 0, (uintptr_t)_ReturnAddress());
+    __try {
+        __asm {
+            mov savedEsp, esp
+            push arg
+            call cb
+            mov esp, savedEsp
+        }
+        LogCallbackReturn(traceSequence, name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        __asm { mov esp, savedEsp }
+        Log("[Proxy] EXCEPTION in CALLBACK #%ld name=\"%s\"; exception absorbed", traceSequence, name);
+    }
+}
+
+// Pushes the "which maps/modes are open" + "which rooms exist" data the
+// GAME ROOM LIST / HOST GAME screen needs. Originally this only ran once,
+// inside LoginServer_EX() -- i.e. at account login, long before the player
+// has even reached the main menu. That matches neither how the real
+// fear-online-server behaves (its rmiRequestLobbyJoin / rmiRequestRoomList
+// handlers -- lobby.go's join()/roomList() -- fire when the client actually
+// asks to enter the lobby / refresh the room list, NOT at login) nor a
+// plausible explanation for why "36001007 Map does not exist" and the empty
+// mode list survived every earlier struct-layout fix: if GameClient.dll's
+// room-create screen clears/rebuilds its own map+mode state each time it is
+// opened (expecting a fresh push in response to the request it just made),
+// a one-shot push at login could be long gone -- overwritten or simply
+// never seen by that screen -- by the time HOST GAME is clicked.
+// Send_LOBBY_ROOM_INFO() (below) is the export the client actually calls
+// when the GAME ROOM LIST screen opens/refreshes (confirmed via the proxy
+// log -- it fires every time that screen is reached), so this same push now
+// also happens there, not just at login.
+static void PushLobbyMapAndRoomData(const char* reason) {
+    Log("[Proxy] PushLobbyMapAndRoomData (from %s)", reason);
+    CallCallbackArray("LOBBY_ALL_MODE_MAP", g_FakeModeMaps, 1);
+    CallCallbackArray("LOBBY_MODE_MAP", g_FakeModeMaps, 1);
+    CallCallbackArray("ROOM_EVENT_MAP_INFO", g_FakeModeMaps, 1);
+    CallCallbackArray("LOBBY_ROOM_INFO", g_FakeRooms, 1);
 }
 
 // ============ Main Exports ============
@@ -554,6 +1303,16 @@ extern "C" __declspec(dllexport) void Tick() {
     static int callCount = 0;
     static bool loggedOnce = false;
 
+    // 2026-11-03: mirror the engine console (all the "yc_"/MissionMgr/
+    // ClientConnectionMgr trace prints) into our log -- see
+    // TryInstallLTClientCPrintHook. Cheap no-op once installed.
+    TryInstallLTClientCPrintHook();
+    g_LastTickMs = GetTickCount();
+
+    DeliverPendingRoomEntry();
+    DeliverPendingGameLoadComplete();
+    DeliverPendingBeginRound();
+
     // The real Tick() (see disassembly of ZNetwork_orig.dll) iterates over
     // several embedded singleton sub-managers and calls their own virtual Tick()
     // if they are not NULL:
@@ -570,6 +1329,29 @@ extern "C" __declspec(dllexport) void Tick() {
         // to our single fake channel.
         *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e0) = &g_FakeChannels44[0];
         *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e4) = &g_FakeChannels44[0] + 1;
+
+        // Open-map index vector at +0x2690/+0x2694 (see InitFakeServerDataOnce
+        // comment) -- re-assert the same way, same reason.
+        *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2690) = &g_OpenMapIndices[0];
+        *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2694) =
+            &g_OpenMapIndices[0] + (sizeof(g_OpenMapIndices) / sizeof(g_OpenMapIndices[0]));
+
+        // "Current room" fields at +0x374/+0x37c/+0x464 (see
+        // InitFakeServerDataOnce comment) -- re-assert the same way.
+        strcpy_s(reinterpret_cast<char*>(g_ServerDataBuffer + 0x37c), 0xe8, "Killhouse Test");
+        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x374) =
+            (InterlockedCompareExchange(&g_RoomEntered, 0, 0) != 0) ? 1 : 0;
+        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x464) = 518;
+        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x440) = 518;  // see InitFakeServerDataOnce
+
+        // Team/user-slot record at +0x48C, plus the "is me"/"is host"
+        // reference fields at +0x000/+0x44C (see the продолжение 18 comment
+        // in InitFakeServerDataOnce()) -- re-assert the same way, same
+        // reason. Was reverted in продолжение 17 after a crash; re-enabled
+        // here with the placeholder-string mitigation described there.
+        WriteFakeRoomUserRecord();   // real layout, see InitFakeServerDataOnce (2026-11-03)
+        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x000) = 1;
+        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x44C) = 1;
 
         // The other known "dangerous" vectors (+0x110/0x114/0x118 --
         // MY_USER_INFO-related, +0x25f0/0x25f4 -- lobbies) we deliberately keep empty
@@ -600,7 +1382,17 @@ extern "C" __declspec(dllexport) void DisConnect() {
     Log("[Proxy] DisConnect()");
 }
 
-extern "C" __declspec(dllexport) int IS_HOST() { return 0; }
+// IS_HOST() flips to true once Send_ROOM_GAME_START() fires (see below). The
+// fear-online-server reference project's proudnet/game_start.go shows the
+// real architecture: ProudNet/ZNetwork only brokers the lobby -- actual
+// gameplay ("running around the map") is a LithTech listen-server that one of
+// the players' own machines hosts (see hostAddress() there, and the
+// lithTechPort=27889 constant we reuse in g_ServerHostData below). For a
+// single local test client, that host can only be us, so once a match starts
+// we must report ourselves as the host or GameClient.dll has no reason to
+// spin up its own listen server and load the map.
+static bool g_IsHost = false;
+extern "C" __declspec(dllexport) int IS_HOST() { return g_IsHost ? 1 : 0; }
 extern "C" __declspec(dllexport) int IS_DEDI() { return 0; }
 extern "C" __declspec(dllexport) int GetPing() { return 30; }
 
@@ -642,10 +1434,24 @@ extern "C" __declspec(dllexport) int __stdcall LoginServer_EX(
     CallCallback2<GateChannelInfo>("GATE_CHANNEL_JOIN", &g_FakeChannels[0], 0);
     CallCallback<GateLobbyInfo>("LOBBY_JOIN", &g_FakeGateLobbyInfo);
     CallCallback<UserInfo>("LOBBY_USER_INFO", &g_FakeUserInfo);
-    CallCallbackArray("LOBBY_ROOM_INFO", g_FakeRooms, 3);
+    // Reverted to the exact inline form confirmed crash-free before the
+    // PushLobbyMapAndRoomData refactor (see doc, "продолжение 4"): the
+    // refactored/helper-function version reproduced a hard, deterministic
+    // crash during THIS call's own byte dump (LOBBY_JOIN), even though the
+    // helper is only invoked AFTER this line -- i.e. not explainable by
+    // control flow. Most likely some pre-existing memory-layout-sensitive
+    // bug elsewhere got tickled by the binary changing shape, not a logic
+    // error in the new calls themselves. Keeping this block textually
+    // identical to the last known-good build while we retest the timing
+    // idea via Send_LOBBY_ROOM_INFO() alone (see there), to isolate whether
+    // it's really the refactor here that's sensitive, or something else.
+    CallCallbackArray("LOBBY_ALL_MODE_MAP", g_FakeModeMaps, 1);
+    CallCallbackArray("LOBBY_MODE_MAP", g_FakeModeMaps, 1);
+    CallCallbackArray("ROOM_EVENT_MAP_INFO", g_FakeModeMaps, 1);
+    CallCallbackArray("LOBBY_ROOM_INFO", g_FakeRooms, 1);
     // CallCallback<LoginFailData>("LOGIN_FAIL", &g_FakeLoginFail);
-    
-    CallCallbackArray("ITEM_INFO", g_FakeItems, 5);
+
+    CallCallbackArray("ITEM_INFO", g_FakeItems, 3);
     
     Log("[Proxy] ========================================");
     Log("[Proxy] LOGIN COMPLETE - FAKE SUCCESS");
@@ -775,9 +1581,491 @@ extern "C" __declspec(dllexport) int Send_LOBBY_USER_INFO() {
     return 1;
 }
 
+// ============ Room / match flow (EXPERIMENTAL -- next thing to verify) ============
+// Everything below is a first attempt at getting past the lobby into an
+// actual, walkable map. Unlike GetServerData()'s offsets (confirmed by
+// disassembly + live x32dbg sessions, see the big comment on
+// InitFakeServerDataOnce), none of the structures GameClient.dll expects from
+// ROOM_INFO/ROOM_JOIN/GAME_START-family callbacks have been confirmed the
+// same way -- this is a best-effort guess built by analogy with the
+// fear-online-server reference project's room/game flow (see
+// server/internal/proudnet/room.go and game_start.go there), reusing our own
+// already-defined LobbyRoomInfo struct where a room needs describing. Each
+// step logs heavily on purpose: check znetwork_proxy_log.txt (and DebugView)
+// after testing to see how far the client gets, and which call (if any)
+// needs a real payload instead of nullptr.
+// True means only that GameClient requested room creation. The room does not
+// exist in the UI until the server's room-state response callbacks are handled.
+static bool g_RoomCreateRequested = false;
+static bool g_MatchStartSent = false;
+
 extern "C" __declspec(dllexport) int Send_LOBBY_ROOM_CREATE_EX(void* data) {
-    Log("[Proxy] Send_LOBBY_ROOM_CREATE_EX(0x%p) -> 1", data);
+    Log("[Proxy] Send_LOBBY_ROOM_CREATE_EX(0x%p)", data);
+    SafeDumpExternal("LOBBY_ROOM_CREATE_EX arg", data, 0x40);
+    const bool firstCreateRequest = !g_RoomCreateRequested;
+    g_RoomCreateRequested = true;
+    g_MatchStartSent = false;
+    if (firstCreateRequest) {
+        InterlockedExchange(&g_RoomEntered, 0);
+        InterlockedExchange(&g_RoomEntryPending, 1);
+    }
+
+    Log("[Proxy] Send_LOBBY_ROOM_CREATE_EX -> accepted; %s deferred room-entry notifications (no map start)",
+        firstCreateRequest ? "queued" : "duplicate request; preserving room state and not re-queuing");
     return 1;
+}
+
+extern "C" __declspec(dllexport) int Send_ROOM_GAME_READY() {
+    Log("[Proxy] Send_ROOM_GAME_READY() -- acking only, no ready/leader state machine yet");
+    return 1;
+}
+
+// ============ Direct call into GameClient.dll's "ConsoleRunWorld" console
+// command implementation (2026-09-11, продолжение) ============
+//
+// Context: the entire Set_On_*_Callback mechanism for actually spinning up a
+// listen server and loading a map turned out to be dead in this build --
+// GAME_START/HOST_GAME_START/Set_OnIoConnectedCallback's handlers are all
+// confirmed (via live Ghidra decompile, following each JMP thunk to a real
+// function body) to be empty `{ return; }` stubs, and GetServerHostData()'s
+// wrapper is never called anywhere in the whole decompile. netstat also
+// confirms port 27889 never actually opens. So nothing we do through that
+// callback path can ever trigger a map load.
+//
+// Instead: the engine ships a large, UI-hidden developer console command
+// table, registered the classic LithTech way via a global command-line-
+// argument/console object (`DAT_104ac068` in the decompile, also used to
+// parse "+LoginServerIP"-style launch args). One registered command,
+// "ConsoleRunWorld", is exactly what we need -- load a world directly, no
+// networking involved. Ghidra-confirmed (real function bodies, not stubs):
+//
+//   LAB_10149460(argc, argv):
+//     if (argc < 1 || argv == 0) print usage; else FUN_10149240(0);
+//
+//   FUN_10149240(param_1 /* passed as 0 by the caller above */):
+//     reads a SECOND, IMPLICIT argument out of the EAX register at entry
+//     (Ghidra shows this as `char *in_EAX` -- a calling-convention detail
+//     the caller's decompile can't show, since Ghidra didn't recognize the
+//     mixed register+stack argument passing here). If that string is
+//     non-null/non-empty: logs "commandline runworld:\n %s", writes two
+//     flag bytes into a global struct at DAT_104a8714+0x52a8/+0x52a9
+//     (param_1 and a constant 1), calls four internal helpers with no
+//     visible arguments (very likely: stash the world name, then queue/
+//     trigger the actual load), builds a small event/message structure on
+//     the stack and dispatches it through a function-pointer table at
+//     DAT_104b79f8+4 (the classic LithTech "post an engine message" idiom).
+//     Returns 1 on success, 0 (with a logged error) if the string was
+//     missing.
+//
+// This confirms ConsoleRunWorld is real, working map-load logic -- not
+// another dead stub -- so it remains the best lead for the user's actual
+// goal (load a map for solo play, no real host/server needed).
+//
+// Testing this as a bare "+ConsoleRunWorld TAM_Killhouse" LAUNCH PARAMETER
+// crashed (znetwork_proxy_log.txt cut off right after "LOGIN COMPLETE -
+// FAKE SUCCESS", the same signature as every other hard crash in this
+// project; Engine_Assert00.log showed only the two pre-existing benign
+// asserts, so this looks like a genuine unhandled access violation, not an
+// assert-and-continue). Two candidate explanations, not mutually
+// exclusive:
+//   1. TIMING: "+ConsoleRunWorld ..." is parsed and executed by
+//      DAT_104ac068's own startup pass over the command line -- the SAME
+//      pass that handles "+LoginServerIP"/"+LoginServerPort" -- meaning it
+//      almost certainly runs at ENGINE STARTUP, long before our fake
+//      LoginServer_EX/room flow has ever run. Whatever state FUN_10149240's
+//      post-validation code pokes (the DAT_104a8714/DAT_104b79f8 globals)
+//      may simply not be initialized yet at that point in a normal client
+//      lifetime -- a very different situation from calling it once the
+//      client is already sitting on our fake room's infinite loading
+//      screen, well past login.
+//   2. CALLING CONVENTION: if the real call site (inside LAB_10149460,
+//      compiler-generated) loads argv[0]'s pointer into EAX right before
+//      calling FUN_10149240(0), and the launch-parameter code path somehow
+//      reaches this without EAX actually holding that pointer (e.g. a
+//      difference in how launch-parameter argv differs from a normal
+//      dispatched console command's argv), `*in_EAX` could dereference
+//      garbage. This wouldn't apply to us calling FUN_10149240 ourselves,
+//      since we control EAX directly at the call site below.
+//
+// Either way, calling FUN_10149240 ourselves -- well after our own fake
+// login/room/GAME_START flow, wrapped in our own __try/__except -- sidesteps
+// explanation 1 entirely (state should already be as initialized as our fake
+// flow ever makes it) and gives us a SAFE experiment for explanation 2: if
+// it crashes, our own SEH catches it (unlike the launch-parameter case,
+// which crashes in engine startup code we have no hook around) and the
+// process should survive with a logged diagnostic instead of a silent
+// cutoff.
+//
+// 2026-09-11 CORRECTION: the first attempt used 0x10149240 as a literal
+// runtime address, reasoning (wrongly) that "ASLR disabled" meant
+// GameClient.dll always loads at Ghidra's assumed preferred base
+// (0x10000000, inferred from the 0x10xxxxxx shape of every address in this
+// decompile). That reasoning only actually held for Engine.exe's own base
+// (an EXE, which the OS loader always tries to place at its own preferred
+// base first and essentially always succeeds, barring ASLR). A DLL is
+// different: even with ASLR off, if its preferred base happens to already
+// be occupied by another module loaded earlier in the process (0x10000000
+// is an extremely common default DLL base -- collisions are the rule, not
+// the exception), the loader silently relocates it elsewhere and patches
+// its own relocation table -- with no randomization involved, but also no
+// guarantee it lands back at 0x10000000. The test confirmed exactly this:
+// znetwork_proxy_log.txt's crash dump showed ExceptionAddress==0x10149240
+// itself (not some address reached *from* it) -- i.e. the CPU faulted
+// trying to execute the very first instruction at that literal address,
+// meaning GameClient.dll is NOT actually sitting at 0x10000000 in this
+// process's address space right now.
+//
+// Fix: resolve GameClient.dll's ACTUAL runtime base via GetModuleHandleA()
+// at call time and rebase Ghidra's address onto it, exactly like the
+// approach already flagged (but not yet needed) earlier in this project for
+// anything living in GameClient.dll rather than Engine.exe.
+static const uintptr_t GHIDRA_ASSUMED_GAMECLIENT_BASE = 0x10000000;
+static const uintptr_t FUN_10149240_GHIDRA_ADDR = 0x10149240;
+
+static char CallConsoleRunWorldDirect(const char* worldName) {
+    HMODULE hGameClient = GetModuleHandleA("GameClient.dll");
+    if (!hGameClient) {
+        Log("[Proxy] CallConsoleRunWorldDirect: GetModuleHandleA(\"GameClient.dll\") failed (err=%lu) -- skipping call", GetLastError());
+        return 0;
+    }
+    const uintptr_t realBase = (uintptr_t)hGameClient;
+    const uintptr_t addr = realBase + (FUN_10149240_GHIDRA_ADDR - GHIDRA_ASSUMED_GAMECLIENT_BASE);
+    char result = 0;
+    uint32_t savedEsp = 0;
+    Log("[Proxy] GameClient.dll runtime base=0x%p (Ghidra assumed 0x%p, delta=0x%08X)",
+        (void*)realBase, (void*)GHIDRA_ASSUMED_GAMECLIENT_BASE,
+        (unsigned)(realBase - GHIDRA_ASSUMED_GAMECLIENT_BASE));
+    Log("[Proxy] Calling FUN_10149240(\"%s\") directly at rebased addr 0x%p (ConsoleRunWorld impl, EAX=worldname, arg=0)...",
+        worldName, (void*)addr);
+    __try {
+        // The real calling convention (stdcall vs. cdecl) of FUN_10149240
+        // isn't confirmed -- everything else internal to this build that we
+        // HAVE been able to check turned out stdcall, but we save/restore
+        // ESP ourselves around the call regardless, so a wrong guess there
+        // corrupts nothing beyond this one function's local stack usage
+        // instead of our own return address/frame.
+        __asm {
+            mov savedEsp, esp
+            mov eax, worldName
+            mov ecx, addr
+            push 0
+            call ecx
+            mov esp, savedEsp
+            mov result, al
+        }
+        Log("[Proxy] FUN_10149240(\"%s\") returned %d (no exception)", worldName, (int)result);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[Proxy] EXCEPTION inside FUN_10149240(\"%s\") -- absorbed by our own SEH, process should survive", worldName);
+        result = 0;
+    }
+    return result;
+}
+
+// ============ Engine console-print capture (2026-11-03) ============
+// GameClient.dll is full of developer trace prints ("yc_ ..." lines: the
+// LoadControlMgr connection state machine, MissionMgr::FinishPreload,
+// "Dedi IP : %s, Port : %d", "Client_On_GAME_START_Callback/ bIntude", error
+// paths like "No valid maps found for this game mode") that all end up in
+// ILTClient::CPrint -- the in-game console, which is disabled in this build,
+// so nobody ever sees them. Every one of GameClient's print wrappers
+// (FUN_10370420 narrow, FUN_10370480 wide, FUN_1037b120 "dedi,...") ends in
+//     ecx = g_pLTClient (DAT_104ac068 / DAT_104bb82c); push str;
+//     call [vtbl + 0x11c]          (thiscall, one arg, callee cleans)
+// The engine's own "ErrorLog 1" console command exists but its print hook
+// pointer is never read anywhere in this Engine.exe build (checked), so it
+// would write an empty file. Instead we patch that ONE vtable slot of the
+// ILTClient object (data patch, no code trampolines) and mirror every line
+// into our log, then forward to the original. Installed lazily from Tick()
+// once g_pLTClient is non-null. This gives us the narrative of what the
+// client is doing after GAME_START without x32dbg.
+static const uintptr_t G_PLTCLIENT_GHIDRA_ADDR = 0x104ac068;   // ILTClient* g_pLTClient in GameClient.dll .data
+static const size_t   ILTCLIENT_CPRINT_VTBL_OFFSET = 0x11c;   // confirmed at the call sites above
+
+typedef void (__fastcall *LTClientCPrint_t)(void* self, void* edxUnused, const char* msg);
+static LTClientCPrint_t g_OrigLTClientCPrint = nullptr;
+static volatile LONG g_CPrintHookState = 0;   // 0 = not tried/retry, 1 = installed, -1 = gave up
+static volatile LONG g_CPrintLinesLogged = 0;
+static const LONG kCPrintLogCap = 6000;        // safety cap so a chatty frame loop can't flood the log
+
+// Console lines are often long (>64 chars), contain '\n' or non-ASCII
+// (Korean/Russian text) -- TryGetString rejects all of that, which is why the
+// first run logged "<unreadable string pointer 0x001AE...>" for perfectly
+// good stack-resident strings. Dedicated copier: SEH-guarded byte reads, up
+// to ~1000 bytes, control characters escaped, high bytes passed through.
+ASAN_NO_INSTRUMENT static size_t CopyConsoleLine(const char* src, char* out, size_t outSize) {
+    size_t n = 0;
+    if (!src || outSize < 4) { if (outSize) out[0] = '\0'; return 0; }
+    for (size_t i = 0; n + 3 < outSize; i++) {
+        uint8_t c;
+        if (!SafeReadByte(reinterpret_cast<const uint8_t*>(src) + i, &c)) { out[n++] = '?'; break; }
+        if (c == 0) break;
+        if (c == '\n') { if (i == 0) continue; out[n++] = '\\'; out[n++] = 'n'; }
+        else if (c == '\r') { /* drop */ }
+        else if (c == '\t') { out[n++] = ' '; }
+        else if (c < 0x20) { out[n++] = '.'; }
+        else out[n++] = (char)c;
+    }
+    // trim trailing "\n" escapes so every entry stays one clean log line
+    while (n >= 2 && out[n - 2] == '\\' && out[n - 1] == 'n') n -= 2;
+    out[n] = '\0';
+    return n;
+}
+
+static void __fastcall HookedLTClientCPrint(void* self, void* edxUnused, const char* msg) {
+    if (InterlockedIncrement(&g_CPrintLinesLogged) <= kCPrintLogCap) {
+        char buf[1100];
+        if (CopyConsoleLine(msg, buf, sizeof(buf)) > 0) {
+            Log("[CPrint] %s", buf);
+        } else {
+            Log("[CPrint] <empty/unreadable string pointer 0x%p>", (const void*)msg);
+        }
+        if (g_CPrintLinesLogged == kCPrintLogCap) {
+            Log("[CPrint] cap of %ld lines reached -- further console output not mirrored", kCPrintLogCap);
+        }
+    }
+    if (g_OrigLTClientCPrint) g_OrigLTClientCPrint(self, edxUnused, msg);
+}
+
+static void TryInstallLTClientCPrintHook() {
+    if (g_CPrintHookState != 0) return;
+    static int attempts = 0;
+    if (++attempts > 600) {   // ~10 s of ticks at 60 Hz; stop nagging
+        g_CPrintHookState = -1;
+        Log("[Proxy] CPrint hook: g_pLTClient never became available -- giving up");
+        return;
+    }
+    HMODULE hGameClient = GetModuleHandleA("GameClient.dll");
+    if (!hGameClient) return;
+    const uintptr_t base = (uintptr_t)hGameClient;
+    void** ppLTClient = reinterpret_cast<void**>(base + (G_PLTCLIENT_GHIDRA_ADDR - GHIDRA_ASSUMED_GAMECLIENT_BASE));
+    void* pLTClient = nullptr;
+    __try {
+        pLTClient = *ppLTClient;
+        if (!pLTClient) return;          // not initialised yet -- retry next tick
+        void** vtbl = *reinterpret_cast<void***>(pLTClient);
+        void** slot = vtbl + (ILTCLIENT_CPRINT_VTBL_OFFSET / sizeof(void*));
+        void* orig = *slot;
+        if (orig == reinterpret_cast<void*>(&HookedLTClientCPrint)) { g_CPrintHookState = 1; return; }
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+            Log("[Proxy] CPrint hook: VirtualProtect failed (err=%lu) -- giving up", GetLastError());
+            g_CPrintHookState = -1;
+            return;
+        }
+        g_OrigLTClientCPrint = reinterpret_cast<LTClientCPrint_t>(orig);
+        *slot = reinterpret_cast<void*>(&HookedLTClientCPrint);
+        VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+        g_CPrintHookState = 1;
+        Log("[Proxy] CPrint hook installed: g_pLTClient=0x%p vtbl=0x%p slot[0x%X]=0x%p (orig 0x%p) -- engine console output now mirrored as [CPrint]",
+            pLTClient, (void*)vtbl, (unsigned)ILTCLIENT_CPRINT_VTBL_OFFSET, (void*)slot, orig);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_CPrintHookState = -1;
+        Log("[Proxy] CPrint hook: exception while reading g_pLTClient/vtable -- giving up");
+    }
+}
+
+// ============ Kick ClientConnectionMgr's session cleanup (2026-11-03) ============
+// Live run of the host-branch build: GAME_START_PRE/GAME_START went through,
+// "[1234] Client_On_Game_Start_PRE_Callback" printed, the UI tore down, our
+// DisConnect()/destoryed() were called -- and then nothing: no "Dedi IP",
+// no "Client_On_GAME_START_Callback/ bIntude", no state-machine prints.
+// FUN_10151060 (the match starter) was never reached.
+//
+// Why: it is only called from ClientConnectionMgr::Update (FUN_100e8280)
+// `case 1` of the CLEANUP state machine (this+0x2ef0: 4 = SessionCleanup ->
+// 3 = DisconnectFromServer -> 1 = done -> if (shell+0x2e9c) FUN_10151060).
+// That machine is kicked by RequestForcedDisconnect_YC (FUN_100e1470:
+// MissionMgr+0x10 = 0; this+0x2ef0 = 4), which InterfaceMgr::EnterMenuState
+// (FUN_10184620, called from the PRE handler via FUN_10166370) only issues
+// when the engine says it is still connected to a server
+// (ILTClient member fn at +0x1038 == IsConnected). In the real game the
+// menu client IS connected (the lobby/"GameServerConnect" server), so the
+// cleanup runs and ends in FUN_10151060. We have no server at all, so
+// IsConnected()==false, nothing is requested, cleanup state stays 0 and
+// the pending-start flag waits forever -- the loading screen.
+//
+// Fix: do exactly what RequestForcedDisconnect_YC does, once, right after
+// GAME_START. The game's own Update then walks 4 -> 3 -> 1 over the next
+// frames (its "DIS_LOG eCleanupState_DisconnectFromServer" print will show
+// up in [CPrint]) and calls FUN_10151060 itself -- no function pointers,
+// no calling-convention guesses, just two plain memory writes into objects
+// whose addresses we resolve from GameClient.dll's runtime base:
+//   g_pClientConnectionMgr = *(DAT_104a7904)   (set in FUN_100e8760)
+//   g_pMissionMgr          = *(DAT_104b3890)   (set in FUN_101b0850)
+static const uintptr_t G_PCLIENTCONNECTIONMGR_GHIDRA_ADDR = 0x104a7904;
+static const uintptr_t G_PMISSIONMGR_GHIDRA_ADDR          = 0x104b3890;
+static const size_t    CCM_CLEANUP_STATE_OFFSET            = 0x2ef0;   // FUN_100e8280: param_1[0xbbc]
+static const size_t    MISSIONMGR_GAMEMODE_OFFSET          = 0x10;
+
+static void KickClientConnectionCleanup() {
+    HMODULE hGameClient = GetModuleHandleA("GameClient.dll");
+    if (!hGameClient) { Log("[Proxy] KickClientConnectionCleanup: GameClient.dll not found"); return; }
+    const uintptr_t base = (uintptr_t)hGameClient;
+    __try {
+        uint8_t* ccm = *reinterpret_cast<uint8_t**>(base + (G_PCLIENTCONNECTIONMGR_GHIDRA_ADDR - GHIDRA_ASSUMED_GAMECLIENT_BASE));
+        uint8_t* mm  = *reinterpret_cast<uint8_t**>(base + (G_PMISSIONMGR_GHIDRA_ADDR - GHIDRA_ASSUMED_GAMECLIENT_BASE));
+        if (!ccm) { Log("[Proxy] KickClientConnectionCleanup: g_pClientConnectionMgr is NULL -- cannot kick"); return; }
+        const int32_t before = *reinterpret_cast<int32_t*>(ccm + CCM_CLEANUP_STATE_OFFSET);
+        if (mm) *reinterpret_cast<uint8_t*>(mm + MISSIONMGR_GAMEMODE_OFFSET) = 0;   // as RequestForcedDisconnect_YC
+        *reinterpret_cast<int32_t*>(ccm + CCM_CLEANUP_STATE_OFFSET) = 4;          // eCleanupState_SessionCleanup
+        Log("[Proxy] KickClientConnectionCleanup: g_pClientConnectionMgr=0x%p cleanupState %d -> 4 (SessionCleanup), g_pMissionMgr=0x%p gameMode reset; expect DIS_LOG ... then 'Dedi IP' from FUN_10151060",
+            (void*)ccm, before, (void*)mm);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[Proxy] KickClientConnectionCleanup: exception while touching ClientConnectionMgr/MissionMgr");
+    }
+}
+
+// Send_ROOM_GAME_START(): the client's "Start" button. In the real
+// architecture (see fear-online-server's beginMatch()/hostAddress()),
+// ProudNet/ZNetwork never runs the match itself -- it just tells everyone in
+// the room which machine is hosting a LithTech listen-server on port 27889
+// (lithTechPort there, confirmed) and steps out of the way. For one local
+// test client, that host can only be us, so this is the one place where
+// flipping IS_HOST() to true actually matters: without it, GameClient.dll has
+// no reason to spin up its own listen server and load a map at all.
+extern "C" __declspec(dllexport) int Send_ROOM_GAME_START() {
+    if (g_MatchStartSent) {
+        Log("[Proxy] Send_ROOM_GAME_START() duplicate ignored; start callbacks already sent");
+        return 1;
+    }
+    // Set this before invoking callbacks because they may synchronously
+    // re-enter the command path through the engine dispatcher.
+    g_MatchStartSent = true;
+    InterlockedExchange(&g_GameLoadCompleteSent, 0);
+    InterlockedExchange(&g_GameLoadCompletePending, 0);
+    Log("[Proxy] ========================================");
+    Log("[Proxy] Send_ROOM_GAME_START() -- switching this client to HOST mode");
+    Log("[Proxy] ========================================");
+    if (!g_RoomCreateRequested) {
+        Log("[Proxy] WARNING: game start requested but Send_LOBBY_ROOM_CREATE_EX never ran -- continuing anyway");
+    }
+
+    InitFakeServerDataOnce();
+    g_IsHost = true;
+    g_ServerHostData.hostMode = 1;      // guess: 1 = actively hosting (was 0 = idle)
+    g_ServerHostData.hostPlayerId = g_FakeUserInfo.userId;
+    strcpy_s(g_ServerHostData.hostIp, "127.0.0.1");
+    g_ServerHostData.hostPort = 27889;  // confirmed LithTech port (see comment above)
+    g_ServerHostData.isRoomOwner = 1;
+
+    // ------------------------------------------------------------------
+    // 2026-11-03: full static analysis of the real match-start path (see
+    // docs/reference_comparison_and_next_steps.md, entry of this date, for
+    // the function-by-function trace). Summary of what GameClient.dll does
+    // after GAME_START, with the real (second-registration) handlers resolved
+    // through the logged StoreCallback pointers + GameClient.dll's runtime
+    // base (0x0B610000 in the last run, NOT the Ghidra base 0x10000000):
+    //
+    //   GAME_START handler (ghidra 0x10341B90, stdcall, 3 args, ret 0xc):
+    //       CGameClientShell::OnGameStart(wideStr, int16, byte)  [0x10146D80]
+    //           stores wideStr (narrowed) at shell+0x535c (64 chars),
+    //           int16 at shell+0x539c, byte at shell+0x539e
+    //       then falls through into the GAME_START_PRE handler [0x10341B20]:
+    //           FUN_101679d0: shell+0x2e9c = 1  ("match start pending")
+    //                         (and clears the +runworld buffer, i.e. the
+    //                          ConsoleRunWorld route is explicitly reset
+    //                          here -- it is NOT part of this flow)
+    //   Then the UI tears down (Menu.SetReturnMenu/OnDestruct cascade), our
+    //   DisConnect()/destoryed() get called (ClientConnectionMgr session
+    //   cleanup), and when the cleanup state machine reaches its final step
+    //   (ClientConnectionMgr::Update, FUN_100e8280, case 1) it sees
+    //   shell+0x2e9c and calls CGameClientShell's match starter
+    //   FUN_10151060, which:
+    //       - formats "%s:%d" from shell+0x535c / shell+0x539c and logs
+    //         "Dedi IP : %s, Port : %d" -- i.e. the GAME_START arguments are
+    //         the GAME HOST ADDRESS and PORT (matching fear-online-server's
+    //         rmiNotifyGameStart {host, port, ...}), NOT a map name;
+    //       - sd = GetServerData();
+    //         if (sd[0xECC] == 0 && *(int*)sd == *(int*)(sd+0x450))
+    //               -> I AM THE HOST: sets host port from shell+0x539c,
+    //                  ClientConnectionMgr::SetupServerHost (m_Type=0 =
+    //                  STARTGAME_HOST), MissionMgr::StartGame(1)
+    //         else  -> JOIN AS CLIENT: SetupClient("host:port"),
+    //                  MissionMgr::StartGame(0xc = eStartGameAsClient)
+    //       - LoadControlMgr::RequestStartGame -> state Hello ->
+    //         StartGameLobby_OnEnter -> ClientConnectionMgr::StartClientServer
+    //         -> ILTClient::StartGame(&request) -> engine hosts GameServer.dll
+    //         locally ("UDP: Hosting on ...") -> MID_START_GAME with the
+    //         world from MapInfo[ServerData+0x440] -> world load.
+    //
+    //   Our buffer had +0x000 == 1 but +0x450 == 0, so every previous run
+    //   took the JOIN branch and tried to connect to whatever string the
+    //   GAME_START args happened to be ("TAM_Killhouse":13 last time) --
+    //   that is the infinite loading screen. Nothing ever listened on 27889
+    //   because this client never decided it was the host.
+    //
+    //   The ORIGINAL ZNetwork.dll's NotifyGameStart handler
+    //   (decompiled_znetwork.c FUN_100a3750) writes, for "you are host":
+    //       sd+0x450 = (uint)sd[0xEE8]   (host index = my index)
+    //       sd+0xE84 = 1; sd[0x43D] = 1; sd[0xE80] = 1; sd[0xECC] = dedi
+    //       flag (0); sd[0xECD] = 0; sd+0xE88 = 1; sd+0x34 = 4;
+    //       sd+0x2700 = 0; sd[0x2704] = 0
+    //   and then calls GAME_START(hostAddrW, (short)port, (byte)intrude).
+    //   Replicate exactly that.
+    // ------------------------------------------------------------------
+    {
+        uint8_t* sd = g_ServerDataBuffer;
+        const int32_t myIndex = *reinterpret_cast<int32_t*>(sd + 0x000);  // 1 (set in InitFakeServerDataOnce/Tick)
+        *reinterpret_cast<int32_t*>(sd + 0x450) = myIndex;               // game host index == me -> HOST branch
+        *reinterpret_cast<uint8_t*>(sd + 0xEE8) = (uint8_t)myIndex;      // original: +0x450 is copied from this byte
+        *reinterpret_cast<int32_t*>(sd + 0x440) = 518;                   // map index copy read at match start
+        *reinterpret_cast<int32_t*>(sd + 0xE84) = 1;
+        *reinterpret_cast<uint8_t*>(sd + 0x43D) = 1;
+        *reinterpret_cast<uint8_t*>(sd + 0xE80) = 1;
+        *reinterpret_cast<uint8_t*>(sd + 0xECC) = 0;                     // NOT a dedicated-server match (required for HOST branch)
+        *reinterpret_cast<uint8_t*>(sd + 0xECD) = 0;
+        *reinterpret_cast<int32_t*>(sd + 0xE88) = 1;
+        *reinterpret_cast<int32_t*>(sd + 0x034) = 4;
+        *reinterpret_cast<int32_t*>(sd + 0x2700) = 0;
+        *reinterpret_cast<uint8_t*>(sd + 0x2704) = 0;
+        Log("[Proxy] ServerData game-start fields set: +0x000=%d +0x450=%d +0xEE8=%d +0xECC=0 +0x440=518",
+            myIndex, *reinterpret_cast<int32_t*>(sd + 0x450), (int)*reinterpret_cast<uint8_t*>(sd + 0xEE8));
+    }
+
+    // GAME_START_PRE first (the real server sends rmiNotifyRoomGame before
+    // rmiNotifyGameStart). Its handler (0x10341B20) takes no arguments and
+    // returns with a plain `ret` -- CallCallbackNotification is the matching
+    // cdecl/no-arg helper (CallCallbackVoid would push an argument that the
+    // handler never pops).
+    CallCallbackNotification("GAME_START_PRE");
+
+    // GAME_START(hostAddressW, port, intrude): host address + port of the
+    // match host. Since we ARE the host, the address is only echoed into the
+    // "Dedi IP" log line; the PORT becomes the listen-server port
+    // (shell+0x539c -> HostOptions+0x1ba -> StartGameRequest.m_HostInfo).
+    static const wchar_t kHostAddress[] = L"127.0.0.1";
+    CallGameStartCallback("GAME_START", kHostAddress, (short)27889, 0);
+    // HOST_GAME_START's registered handler is a confirmed `ret` stub
+    // (0x1034F330); harmless, kept for parity with the real sequence.
+    CallGameStartCallback("HOST_GAME_START", kHostAddress, (short)27889, 0);
+
+    // The real client only gets from here to the match starter
+    // (FUN_10151060) through ClientConnectionMgr's session-cleanup state
+    // machine, which nobody kicks when the engine isn't connected to a
+    // server -- see KickClientConnectionCleanup().
+    KickClientConnectionCleanup();
+
+    // NOTE: CallConsoleRunWorldDirect() is intentionally no longer called.
+    // The +runworld mechanism it drives is the single-player "run this world
+    // file" path; GAME_START_PRE explicitly clears that buffer, and the
+    // genuine multiplayer path above hosts the world through the engine's
+    // StartGame(STARTGAME_HOST) instead.
+
+    Log("[Proxy] Send_ROOM_GAME_START() -> 1 (IS_HOST now reports true, host=127.0.0.1:27889)");
+    return 1;
+}
+
+static void EnsureLocalMapStart(const char* source) {
+    if (!g_RoomCreateRequested) {
+        Log("[Proxy] %s: room create export has not completed; skipping local start", source);
+        return;
+    }
+    if (g_MatchStartSent) {
+        Log("[Proxy] %s: Send_ROOM_GAME_START already handled by the game", source);
+        return;
+    }
+    Log("[Proxy] %s: game did not call Send_ROOM_GAME_START; starting local map fallback", source);
+    Send_ROOM_GAME_START();
 }
 
 extern "C" __declspec(dllexport) int Send_LOBBY_ROOM_JOIN(int roomId) {
@@ -792,6 +2080,10 @@ extern "C" __declspec(dllexport) int Send_LOBBY_QUICK_JOIN() {
 
 extern "C" __declspec(dllexport) int Send_LOBBY_ROOM_INFO() {
     Log("[Proxy] Send_LOBBY_ROOM_INFO() -> 1");
+    // The client calls this when the GAME ROOM LIST screen opens/refreshes --
+    // re-push the map/mode/room data here too, not just once at login (see
+    // PushLobbyMapAndRoomData comment above for why).
+    PushLobbyMapAndRoomData("Send_LOBBY_ROOM_INFO");
     return 1;
 }
 
@@ -802,7 +2094,109 @@ extern "C" __declspec(dllexport) int Send_ROOM_SETTING() {
 
 extern "C" __declspec(dllexport) int Send_GAME_LOAD_PERCENT(int percent) {
     Log("[Proxy] Send_GAME_LOAD_PERCENT(%d%%) -> 1", percent);
+    // 2026-11-03 live run: the client reached "ClientLoadingProcess_Complete",
+    // reported Send_GAME_LOAD_PERCENT(100) twice, then sat at
+    // "nLoadingPct: 100" for ~30 s and gave up with Send_GAME_LEAVE. It never
+    // called Send_GAME_START_PRE_COMPLETE -- 100% load progress IS the
+    // "I'm ready" signal the real server answers with NotifyGameLoadComplete.
+    if (percent >= 100) {
+        if (InterlockedCompareExchange(&g_GameLoadCompleteSent, 0, 0) == 0) {
+            InterlockedExchange(&g_GameLoadCompletePending, 1);
+            const DWORD sinceTick = GetTickCount() - g_LastTickMs;
+            if (g_LastTickMs != 0 && sinceTick < 1000) {
+                Log("[Proxy] load reached 100%% -> queueing load-complete sequence for next Tick (last Tick %lu ms ago)", sinceTick);
+            } else {
+                // Tick() is not being called any more at this point (the
+                // lobby session was torn down) -- deliver inline instead.
+                Log("[Proxy] load reached 100%% and Tick() is silent (%lu ms) -> delivering load-complete sequence inline", sinceTick);
+                DeliverPendingGameLoadComplete();
+            }
+        }
+    }
     return 1;
+}
+
+// 2026-11-03: GAME_LOAD_COMPLETE is NOT a passive "all loaded" notice -- its
+// real handler (0x1033FD20, no arguments, plain ret) is what moves the
+// LoadControlMgr state machine into state 0xb = eClientConnectionState_
+// StartLoadWorld: it prints "##### Client_On_GAME_LOAD_COMPLETE_Callback",
+// pokes the engine (g_pLTClient slot 0x14 -> ->vtbl[100]) when
+// ServerData[0xECC]==0, calls LoadControlMgr::SetState(0xb) and applies the
+// local players' loadouts. In the real protocol the client, once its local
+// listen server is up and it has reached PreGameLobby, reports
+// Send_GAME_START_PRE_COMPLETE (and Send_GAME_LOAD_PERCENT) to ZNetwork, the
+// server answers NotifyGameLoadComplete, and ZNetwork_orig's handler
+// (decompiled_znetwork.c FUN_100a5130) does `ServerData+0xE84 = 2` and fires
+// the callback. So: when the client tells us it is ready, answer the same way
+// -- but from Tick(), not re-entrantly from inside the export (same rule as
+// the deferred room-entry sequence).
+
+extern "C" __declspec(dllexport) int Send_GAME_START_PRE_COMPLETE() {
+    Log("[Proxy] Send_GAME_START_PRE_COMPLETE() -> 1 (queueing GAME_LOAD_COMPLETE for next Tick)");
+    InterlockedExchange(&g_GameLoadCompletePending, 1);
+    return 1;
+}
+
+static void DeliverPendingGameLoadComplete() {
+    if (InterlockedCompareExchange(&g_GameLoadCompletePending, 0, 0) == 0 ||
+        InterlockedCompareExchange(&g_GameLoadCompleteSent, 0, 0) != 0) return;
+    InterlockedExchange(&g_GameLoadCompletePending, 0);
+    InterlockedExchange(&g_GameLoadCompleteSent, 1);
+    // Replicate the ORIGINAL ZNetwork.dll for the host:
+    //  FUN_100a50c0 (NotifyUserLoadComplete): in GetServerHostData() find the
+    //    20-entry user table at +0x388 (0x60 bytes each, [+0] = user index),
+    //    set its "loaded" byte (+0xD, i.e. hostdata+0x395 for entry 0), then
+    //    HOST_GAME_USER_LOAD_COMPLETE(userIndex) -- the in-process
+    //    GameServer.dll registered that one (StoreCallback -> 0x39xxxxxx).
+    //  FUN_100a5130 (NotifyGameLoadComplete): ServerData+0xE84 = 2; for the
+    //    host also hostdata+0x33c = 2 and HOST_GAME_LOAD_COMPLETE();
+    //    then GAME_LOAD_COMPLETE() on the client side.
+    uint8_t* hd = g_ServerHostDataBuffer;
+    *reinterpret_cast<uint32_t*>(hd + 0x388) = 1;   // entry 0: my user index (== ServerData+0x000)
+    *reinterpret_cast<uint8_t*>(hd + 0x395) = 1;    // entry 0: loaded
+    *reinterpret_cast<int32_t*>(hd + 0x33c) = 2;
+    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0xE84) = 2;   // as ZNetwork_orig FUN_100a5130
+    Log("[Proxy] Delivering load-complete sequence from Tick(): HOST_GAME_USER_LOAD_COMPLETE(1), HOST_GAME_LOAD_COMPLETE(), GAME_LOAD_COMPLETE()");
+    CallCallbackInt1Safe("HOST_GAME_USER_LOAD_COMPLETE", 1);
+    CallCallbackNotification("HOST_GAME_LOAD_COMPLETE");
+    CallCallbackNotification("GAME_LOAD_COMPLETE");
+}
+
+// 2026-11-03 live run #2: the world loaded, the client went PostLoad ->
+// RegisterMatch -> Playing_OnEnter, and the in-process GameServer.dll
+// immediately called Send_HOST_GAME_BEGIN_ROUND() -- "server asks the match
+// service to start the round". The real service answers NotifyBeginRound;
+// ZNetwork_orig's handler (decompiled_znetwork.c FUN_100a4c70) then, in
+// GetServerHostData(): for every user entry (+0x388 + i*0x60) whose byte at
+// +4 (0x38C) is set, state dword at +8 (0x390) = 3; hostdata+0x340 = round
+// number; hostdata+0x33c = 3; and calls HOST_GAME_BEGIN_ROUND() (no args,
+// registered by GameServer.dll). The client-side GAME_BEGIN_ROUND is a `ret`
+// stub and is never invoked by the original. Without this answer the round
+// never starts: HUD up, timer 00:00, no spawn, black screen.
+extern "C" __declspec(dllexport) int Send_HOST_GAME_BEGIN_ROUND() {
+    Log("[Proxy] Send_HOST_GAME_BEGIN_ROUND() -> 1 (queueing HOST_GAME_BEGIN_ROUND answer)");
+    InterlockedExchange(&g_BeginRoundPending, 1);
+    const DWORD sinceTick = GetTickCount() - g_LastTickMs;
+    if (g_LastTickMs == 0 || sinceTick >= 1000) {
+        Log("[Proxy] Tick() is silent (%lu ms) -> delivering begin-round inline", sinceTick);
+        DeliverPendingBeginRound();
+    }
+    return 1;
+}
+
+static void DeliverPendingBeginRound() {
+    if (InterlockedCompareExchange(&g_BeginRoundPending, 0, 0) == 0) return;
+    InterlockedExchange(&g_BeginRoundPending, 0);
+    const LONG round = InterlockedIncrement(&g_BeginRoundCount);
+    uint8_t* hd = g_ServerHostDataBuffer;
+    *reinterpret_cast<uint32_t*>(hd + 0x388) = 1;   // entry 0: my user index
+    *reinterpret_cast<uint8_t*>(hd + 0x38C) = 1;    // entry 0: present
+    *reinterpret_cast<uint32_t*>(hd + 0x390) = 3;   // entry 0: state = in round
+    *reinterpret_cast<uint8_t*>(hd + 0x395) = 1;    // entry 0: loaded
+    *reinterpret_cast<uint32_t*>(hd + 0x340) = (uint32_t)round;
+    *reinterpret_cast<int32_t*>(hd + 0x33c) = 3;
+    Log("[Proxy] Delivering HOST_GAME_BEGIN_ROUND (round %ld) -- hostdata+0x33c=3, +0x340=%ld, user0 state=3", round, round);
+    CallCallbackNotification("HOST_GAME_BEGIN_ROUND");
 }
 
 #define SEND_LIST \
@@ -819,7 +2213,7 @@ extern "C" __declspec(dllexport) int Send_GAME_LOAD_PERCENT(int percent) {
     X(DAILY_MISSION_INFO) X(DAILY_MISSION_START) X(FRIEND_DELETE) \
     X(FRIEND_INVITE) X(FRIEND_REQUEST) X(FRIEND_REQUEST_ACCEPT) \
     X(FRIEND_REQUEST_REFUSE) X(GAME_HIT_COUNT) X(GAME_LEAVE) \
-    X(GAME_PING) X(GAME_START_PRE_COMPLETE) X(GATE_CHANNEL_JOIN) \
+    X(GAME_PING) X(GATE_CHANNEL_JOIN) \
     X(GATE_LOBBY_INFO) X(GATE_LOBBY_JOIN) X(GATE_SERVER_INFO) \
     X(GATE_SERVER_JOIN) X(GIFT_DELETE_RECEIVE) X(GIFT_DELETE_SEND) \
     X(GIFT_LOAD_RECEIVE_PAGE) X(GIFT_LOAD_SEND_PAGE) X(GIFT_READ) \
@@ -834,7 +2228,7 @@ extern "C" __declspec(dllexport) int Send_GAME_LOAD_PERCENT(int percent) {
     X(HANGAR_MONEY) X(HANGAR_NICKNAME_CHANGE) X(HANGAR_OPEN) \
     X(HANGAR_PARTS_SLOT) X(HANGAR_RECIPE_ITEM) X(HANGAR_WEAPON_CUSTOM_SLOT) \
     X(HANGAR_WEAPON_SLOT) X(HANGAR_WEAR_SLOT) X(HOST_DAILY_MISSION_CLEAR) \
-    X(HOST_GAME_BEGIN_ROUND) X(HOST_GAME_BOMB) X(HOST_GAME_CHECK_BODY) \
+    X(HOST_GAME_BOMB) X(HOST_GAME_CHECK_BODY) \
     X(HOST_GAME_GHOST) X(HOST_GAME_INSTANT_RESPAWN) X(HOST_GAME_LEAVE) \
     X(HOST_GAME_MUST_LOAD_COMPLETE) X(HOST_GAME_OCCUPY) X(HOST_GAME_PING) \
     X(HOST_GAME_PVE_DATANET) X(HOST_GAME_PVE_DOLL) X(HOST_GAME_PVE_HELP) \
@@ -853,7 +2247,7 @@ extern "C" __declspec(dllexport) int Send_GAME_LOAD_PERCENT(int percent) {
     X(POST_LOAD_SEND_PAGE) X(POST_OPEN) X(POST_READ) X(POST_WRITE) \
     X(PURCHASE_FINALIZE) X(PURCHASE_INIT) X(RECIPE_CLOSE) X(RECIPE_ITEM) \
     X(RECIPE_OPEN) X(RECIPE_OPEN_NEW) X(REPORT_USER) X(ROOM_DETAIL_SETTING) \
-    X(ROOM_DETAIL_SETTING_EX) X(ROOM_GAME_READY) X(ROOM_GAME_START) \
+    X(ROOM_DETAIL_SETTING_EX) \
     X(ROOM_INVITE) X(ROOM_INVITE_USER_INFO) X(ROOM_LEAVE) X(ROOM_MAP) \
     X(ROOM_MAP_CHANGE) X(ROOM_MATCH_CANCEL) X(ROOM_MATCH_JOIN) \
     X(ROOM_MATCH_START) X(ROOM_USER_TEAM) X(SEARCH_USER) \
@@ -872,7 +2266,23 @@ SEND_LIST
 // without hidden reentrancy issues (the SafeReadByte function itself is declared
 // earlier in the file, near Log()).
 
-static void TryLogString(const char* label, const void* ptr) {
+ASAN_NO_INSTRUMENT static bool TryGetString(const void* ptr, char* outBuf, size_t outBufSize) {
+    if (!ptr || !outBuf || outBufSize == 0) return false;
+    const uint8_t* s = (const uint8_t*)ptr;
+    size_t len = 0;
+    size_t maxLen = (outBufSize - 1 < 64) ? (outBufSize - 1) : 64;
+    for (; len < maxLen; len++) {
+        uint8_t c;
+        if (!SafeReadByte(s + len, &c)) return false;  // page inaccessible -- not a string
+        if (c == 0) break;
+        if (c < 0x20 || c > 0x7E) return false;
+        outBuf[len] = (char)c;
+    }
+    outBuf[len] = '\0';
+    return len > 0;
+}
+
+ASAN_NO_INSTRUMENT static void TryLogString(const char* label, const void* ptr) {
     if (!ptr) return;
     const uint8_t* s = (const uint8_t*)ptr;
     char buf[65];
@@ -891,7 +2301,7 @@ static void TryLogString(const char* label, const void* ptr) {
     }
 }
 
-static void TryLogWideString(const char* label, const void* ptr) {
+ASAN_NO_INSTRUMENT static void TryLogWideString(const char* label, const void* ptr) {
     if (!ptr) return;
     const uint8_t* s = (const uint8_t*)ptr;
     wchar_t buf[65];
@@ -911,7 +2321,7 @@ static void TryLogWideString(const char* label, const void* ptr) {
     }
 }
 
-static void DumpBufferRegion(const char* label, const uint8_t* buf, size_t offset, size_t len) {
+ASAN_NO_INSTRUMENT static void DumpBufferRegion(const char* label, const uint8_t* buf, size_t offset, size_t len) {
     Log("[Proxy] --- %s (offset 0x%zX, %zu bytes) ---", label, offset, len);
     char line[128];
     for (size_t i = 0; i < len; i += 16) {
@@ -923,7 +2333,7 @@ static void DumpBufferRegion(const char* label, const uint8_t* buf, size_t offse
     }
 }
 
-static void DumpServerDataHotspots() {
+ASAN_NO_INSTRUMENT static void DumpServerDataHotspots() {
     // All offsets we've already confirmed by disassembly as actually
     // read/written by the engine inside the GetServerData()-buffer:
     //   +0x018       -- field read by FUN_006383b0 (current crash, GameServerConnect)
@@ -938,7 +2348,7 @@ static void DumpServerDataHotspots() {
     Log("[Proxy] ==================================================");
 }
 
-static void DumpCrashDiagnostics(EXCEPTION_POINTERS* ex) {
+ASAN_NO_INSTRUMENT static void DumpCrashDiagnostics(EXCEPTION_POINTERS* ex) {
     CONTEXT* c = ex->ContextRecord;
     Log("[Proxy] --- Registers ---");
     Log("[Proxy]   EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X",
@@ -1078,8 +2488,9 @@ static void __cdecl OnInvalidParameter(const wchar_t* expr, const wchar_t* func,
 }
 
 // ============ DllMain ============
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_hThisModule = hModule;
         DisableThreadLibraryCalls(hModule);
 
         // IMPORTANT: open the log file IMMEDIATELY, synchronously, here -- not lazily
@@ -1107,19 +2518,75 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ex) -> LONG {
             static int loggedCount = 0;
             static volatile bool inHandler = false;  // protection against recursive crash inside the handler itself
-            if (ex->ExceptionRecord->ExceptionCode == 0xC0000005 && loggedCount < 3 && !inHandler) {
+            const DWORD exceptionCode = ex->ExceptionRecord->ExceptionCode;
+            // OutputDebugString raises DBG_PRINTEXCEPTION_C / DBG_PRINTEXCEPTION_WIDE_C
+            // in a debugger-aware process. They are normal diagnostics, not game
+            // faults; logging them used up the first-chance exception budget before
+            // the actual failure happened.
+            if ((exceptionCode & 0xFFFF0000) == 0x40010000 ||
+                exceptionCode == EXCEPTION_BREAKPOINT ||
+                exceptionCode == EXCEPTION_SINGLE_STEP) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            if (loggedCount < 12 && !inHandler) {
                 inHandler = true;
                 loggedCount++;
                 Log("[Proxy] ========================================");
-                Log("[Proxy] VECTORED EXCEPTION HANDLER CAUGHT ACCESS VIOLATION (occurrence %d)!", loggedCount);
-                Log("[Proxy] (The game will most likely catch and \"swallow\" this via SEH");
-                Log("[Proxy] further down the chain -- this is only for our diagnostics.)");
+                Log("[Proxy] VECTORED EXCEPTION code=0x%08X (occurrence %d)",
+                    exceptionCode, loggedCount);
                 Log("[Proxy] ExceptionAddress: 0x%p", ex->ExceptionRecord->ExceptionAddress);
-                Log("[Proxy] Access Violation! Address: 0x%p",
-                    ex->ExceptionRecord->ExceptionInformation[1]);
-                DumpCrashDiagnostics(ex);
+                Log("[Proxy] Last dispatcher: %s param2=0x%08X param3=0x%08X param4=0x%08X",
+                    g_LastDispatchName, g_LastDispatchParams[0],
+                    g_LastDispatchParams[1], g_LastDispatchParams[2]);
+                LogLastCallbackContext();
+                if (exceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+                    Log("[Proxy] Access Violation! Address: 0x%p",
+                        ex->ExceptionRecord->ExceptionInformation[1]);
+                    // 2026-11-03: the intermittent "dies right after LOGIN
+                    // COMPLETE" case is the known dispatcher-epilogue crash
+                    // (corrupted EBP -> LEAVE/RET -> EIP=0) in the variant
+                    // where ESP is ALSO garbage (e.g. ESP=0x0034004B, EBP=0
+                    // in the 2026-10 log). The kernel still delivered the
+                    // exception (so this handler runs), but the stack
+                    // pointer is outside this thread's real stack: every
+                    // __try in the deep dump below pushes an SEH frame at
+                    // that bogus ESP, the OS then sees an exception chain
+                    // outside the TEB stack limits on the very first probe
+                    // fault and terminates the process -- the log stops at
+                    // "Registers as strings". So: if ESP is outside
+                    // [StackLimit, StackBase), log that fact and bail out
+                    // WITHOUT any SEH-based probing, letting the dispatcher
+                    // hook's own __except (registered while the stack was
+                    // still sane) absorb the crash like it does in the
+                    // "ESP still valid" runs.
+                    const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+                    const uintptr_t esp = ex->ContextRecord->Esp;
+                    const uintptr_t stackLo = reinterpret_cast<uintptr_t>(tib->StackLimit);
+                    const uintptr_t stackHi = reinterpret_cast<uintptr_t>(tib->StackBase);
+                    if (esp < stackLo || esp >= stackHi) {
+                        Log("[Proxy] ESP=0x%08X is OUTSIDE this thread's stack [0x%08X,0x%08X) -- EIP=0x%p EBP=0x%08X; skipping deep dump (SEH probes would kill the process)",
+                            (unsigned)esp, (unsigned)stackLo, (unsigned)stackHi,
+                            ex->ExceptionRecord->ExceptionAddress, (unsigned)ex->ContextRecord->Ebp);
+                    } else {
+                        DumpCrashDiagnostics(ex);
+                    }
+                    // A fault while the UI command dispatcher is running under our
+                    // guard: repair the context and continue past the dispatcher
+                    // (no unwinding involved -- works with a trashed stack too).
+                    if (TryResumeGuardedDispatcher(ex)) {
+                        Log("[Proxy] ========================================");
+                        inHandler = false;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
                 Log("[Proxy] ========================================");
                 inHandler = false;
+            }
+            // Not ours to recover -- but if a guarded dispatcher call is active
+            // and this is an access violation we did not log (budget exhausted),
+            // still recover it rather than let the OS fail to unwind.
+            if (exceptionCode == EXCEPTION_ACCESS_VIOLATION && !inHandler && TryResumeGuardedDispatcher(ex)) {
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
             return EXCEPTION_CONTINUE_SEARCH;  // don't interfere with the game's own handling
         });
@@ -1129,6 +2596,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             Log("[Proxy] UNHANDLED EXCEPTION!");
             Log("[Proxy] ExceptionCode: 0x%08X", ex->ExceptionRecord->ExceptionCode);
             Log("[Proxy] ExceptionAddress: 0x%p", ex->ExceptionRecord->ExceptionAddress);
+            LogLastCallbackContext();
             if (ex->ExceptionRecord->ExceptionCode == 0xC0000005) {
                 Log("[Proxy] Access Violation! Address: 0x%p", 
                     ex->ExceptionRecord->ExceptionInformation[1]);
@@ -1140,6 +2608,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         
         Log("[Proxy] ========================================");
         Log("[Proxy] ZNetwork PROXY LOADED (safe version, no byte-scan patching)");
+        Log("[Proxy] Process id=%lu; callback trace enabled", GetCurrentProcessId());
         Log("[Proxy] ========================================");
 
         // APPLY PATCHES IMMEDIATELY ON LOAD
@@ -1149,6 +2618,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         ApplyAllPatches();
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_LogFile) {
+            Log("[Proxy] DLL_PROCESS_DETACH reserved=0x%p roomCreateRequested=%d matchStartSent=%d lastDispatch=\"%s\"",
+                reserved, g_RoomCreateRequested ? 1 : 0, g_MatchStartSent ? 1 : 0,
+                g_LastDispatchName);
+            LogLastCallbackContext();
             fclose(g_LogFile);
             g_LogFile = nullptr;
         }

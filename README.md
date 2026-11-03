@@ -1,7 +1,7 @@
 ![Screenshot](assets/images/logo.jpg)
 
 # F.E.A.R. Online — Reverse Engineering Notes
-## Status: Not working yet.
+## Status: Single-player mode works.
 
 Notes on analyzing authentication and client startup for F.E.A.R. Online
 (Steam release, published by Aeria Games) for the purpose of standing up
@@ -9,6 +9,8 @@ a private server.
 
 - **Steam App ID:** 223650 (only available via direct link)
 - Install: `Win+R` → `steam://install/223650/` (includes DLC)
+
+![Screenshot](_examples/image_4.png)
 
 ---
 
@@ -325,3 +327,7 @@ L---LauncherData
 |==|==|==|==|==|==steam_appid.txt
 |==|==|==|==|==|==ZLauncher.dll
 ```
+
+[![Patreon](https://c5.patreon.com/external/logo/become_a_patron_button.png)](https://www.patreon.com/cw/shibisty)
+
+If this project helps you, consider supporting its development on Patreon ❤️

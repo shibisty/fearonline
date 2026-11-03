@@ -19,3 +19,9 @@ trash
 *.exp
 *.lib
 venv
+znetwork_proxy_log.txt
+DEBUGGING.md
+plan_gns_server.md
+reference_comparison_and_next_steps.md
+callback_map_2026-10-run.txt
+cleanup_report.txt
