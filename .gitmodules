@@ -4,3 +4,6 @@
 [submodule "rw-file-detector"]
 	path = rw-file-detector
 	url = https://github.com/shibisty/rw-file-detector.git
+[submodule "ext-mv"]
+	path = ext-mv
+	url = https://github.com/shibisty/ext-mv.git
