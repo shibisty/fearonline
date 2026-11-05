@@ -10,7 +10,7 @@ a private server.
 - **Steam App ID:** 223650 (only available via direct link)
 - Install: `Win+R` → `steam://install/223650/` (includes DLC)
 
-![Screenshot](_examples/image_4.png)
+[![Screenshot](_examples/image_4.png)](https://youtu.be/ICbHgZF7kco)
 
 ---
 
