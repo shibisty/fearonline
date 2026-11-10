@@ -47,11 +47,6 @@ static volatile LONG g_LastCallbackReturnedSequence = 0;
 static const char* volatile g_LastCallbackName = "<none>";
 static void* volatile g_LastCallbackTarget = nullptr;
 static const void* volatile g_LastCallbackData = nullptr;
-// Room-create is requested from inside the UI command dispatcher. Defer the
-// synthetic server response until Tick() so the room callbacks are not
-// re-entered while the Host Game command is still on the stack.
-static volatile LONG g_RoomEntryPending = 0;
-static volatile LONG g_RoomEntered = 0;
 // GAME_LOAD_COMPLETE answer to Send_GAME_START_PRE_COMPLETE, delivered from Tick()
 // (see Send_GAME_START_PRE_COMPLETE below).
 static volatile LONG g_GameLoadCompletePending = 0;
@@ -296,38 +291,9 @@ struct ItemInfo {
 // reading/writing fields by name (g_ServerData.xxx) continues to work as is.
 static uint8_t g_ServerDataBuffer[65536] = { 0 };
 
-// Open-map index whitelist -- see the +0x2690/+0x2694 comment in
-// InitFakeServerDataOnce() below. File-scope (not function-local) so both
-// InitFakeServerDataOnce() and the Tick() re-assertion can point into it.
-static uint16_t g_OpenMapIndices[] = { 518 /* TAM_Killhouse */ };
 static ServerData& g_ServerData = *reinterpret_cast<ServerData*>(g_ServerDataBuffer);
 
-// 2026-09-11 (продолжение 18): placeholder string used to fill unmapped
-// team/user-slot record fields (see the +0x48C comment below) with a
-// valid, non-null pointer instead of leaving them 0 -- see that comment
-// for why. Always valid for the process lifetime (static storage).
-static const char g_FakeUserPlaceholderText[] = "Host";
-
-// 2026-11-03: fills slot 0 of the 20-entry room user list at
-// GetServerData()+0x48C with the layout written by the ORIGINAL
-// ZNetwork.dll (decompiled_znetwork.c FUN_10088290) -- see the comment in
-// InitFakeServerDataOnce(). One record for "me": index 1, team 1, level 10,
-// nickname "Host", no clan. Idempotent; called from init and every Tick().
-static void WriteFakeRoomUserRecord() {
-    uint8_t* rec = g_ServerDataBuffer + 0x48C;
-    memset(rec, 0, 0x74);
-    *reinterpret_cast<int32_t*>(rec + 0x00) = 1;     // user index (== ServerData+0x000)
-    *reinterpret_cast<uint8_t*>(rec + 0x04) = 1;     // occupied
-    *reinterpret_cast<int32_t*>(rec + 0x08) = 0;     // state (switch default)
-    *reinterpret_cast<int32_t*>(rec + 0x0C) = 0;     // 2 would mean "left"
-    *reinterpret_cast<int32_t*>(rec + 0x10) = 1;     // team 1
-    *reinterpret_cast<int32_t*>(rec + 0x14) = 10;    // byte arg of the writer (level/character)
-    wcscpy_s(reinterpret_cast<wchar_t*>(rec + 0x18), 16, L"Host");   // inline wide nickname
-    // +0x38..+0x44: four clan-mark ints = 0; +0x48: inline wide clan name = L""
-    *reinterpret_cast<wchar_t*>(rec + 0x48) = L'\0';
-    *reinterpret_cast<uint8_t*>(rec + 0x70) = 0;     // trailing byte flag (ready?)
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x3C) = 1;   // my team (writer: sd+0x3C when index == *sd)
-}
+// (2026-11-10: the room user slot writer moved to fo_world.inc -- FoWriteRoomUserRecord.)
 
 static uint8_t g_ServerHostDataBuffer[65536] = { 0 };
 static ServerHostData& g_ServerHostData = *reinterpret_cast<ServerHostData*>(g_ServerHostDataBuffer);
@@ -367,6 +333,9 @@ static ChannelRecord g_FakeChannels44[1] = {
 // we leave the vector empty (begin==end==0), which is safe: the code simply
 // skips the loop if begin==0.
 
+// Offline world model (fo_world.inc, included after the callback helpers).
+static void FoWorldInitOnce();
+
 static bool g_ServerDataInitialized = false;
 static void InitFakeServerDataOnce() {
     if (g_ServerDataInitialized) return;  // don't touch the buffer again -- the engine may have already written to it
@@ -384,203 +353,13 @@ static void InitFakeServerDataOnce() {
     *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e0) = &g_FakeChannels44[0];
     *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e4) = &g_FakeChannels44[0] + 1;
 
-    // 2026-09-11: "open map index" vector, begin/end at +0x2690/+0x2694 of
-    // this SAME GetServerData() buffer -- confirmed by decompile, not a
-    // guess. GameClient.dll's FUN_10079270 (builds the HOST GAME map table
-    // from MapInfo.csv) computes each row's IsOpenMap by calling
-    // FUN_10073e30(mapIndex), which does:
-    //     thunk_FUN_103505f0();               // ensure network iface exists
-    //     iVar2 = thunk_FUN_1034ef00();        // calls GetServerData() (see
-    //                                          // FUN_1034ef00: param_1[7] is
-    //                                          // literally the resolved
-    //                                          // "GetServerData" export,
-    //                                          // called with no args) and
-    //                                          // caches/returns its result
-    //     begin = *(int*)(iVar2 + 0x2690);
-    //     end   = *(int*)(iVar2 + 0x2694);
-    //     count = (end - begin) >> 1;          // uint16 elements
-    //     for i in [0,count): if *(ushort*)(begin + i*2) == mapIndex -> open
-    // This is a completely different (and much safer) path than the
-    // Set_On_LOBBY_ALL_MODE_MAP_Callback / Set_On_ROOM_OPEN_MAP_INFO_Callback
-    // route we spent most of this session on: decompiled BOTH of those
-    // registered handlers (FUN_1034f090, FUN_1034f130) and both are
-    // literally `{ return; }` no-ops in this GameClient.dll build. So no
-    // struct we ever pass to those two callbacks can matter -- this vector,
-    // written directly into memory WE already own and control via
-    // GetServerData(), is the actual mechanism. No stdcall arg-count risk,
-    // no crash risk like the earlier struct experiments.
-    *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2690) = &g_OpenMapIndices[0];
-    *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2694) =
-        &g_OpenMapIndices[0] + (sizeof(g_OpenMapIndices) / sizeof(g_OpenMapIndices[0]));
-
-    // 2026-09-11: "current room" fields, found the same way as the open-map
-    // vector above -- traced thunk_FUN_101a1f60 (called from several places,
-    // looks like the Game Room screen's refresh routine), which does
-    // thunk_FUN_103505f0(); iVar4 = thunk_FUN_1034ef00(); (== GetServerData())
-    // then reads, when *(int*)(iVar4+0x34) != 8 (our buffer defaults that
-    // slot to 0, so we take this branch):
-    //   +0x374 int    -> _global.g_nMonolithPlayerCurRoomIndex
-    //   +0x37c char[] -> _global.g_sMonolithPlayerCurRoomTitle (embedded
-    //                    string, NOT a pointer -- passed as (iVar4+0x37c)
-    //                    itself, room for up to (0x464-0x37c)=0xe8 bytes
-    //                    before the next known field)
-    //   +0x464 int    -> _global.g_nMonolithPlayerCurMapIndex
-    //   +0x468 int    -> _global.g_nMonolithPlayerCurGoalRound (this branch)
-    //   +0x46c int    -> _global.g_nMonolithPlayerCurGoalKill
-    //   +0x474 int    -> _global.g_nMonolithPlayerCurGoalTime
-    // This is presumably why the Game Room screen showed
-    // "[ERROR: Invalid String ID]" for the room title/mode after HOST GAME
-    // finally got past the map-open check: nothing had ever written here.
-    // GoalKill/Round/Time are left at 0 for now -- the visible "100KILL" in
-    // the room UI already renders correctly from a different, already-
-    // working path (the MapInfo.csv-driven map table), so these specific
-    // fields are not proven necessary yet; CurMapIndex is set because it's
-    // the most likely trigger for "which map to actually load" once the
-    // match starts, which is untested territory beyond the room screen.
-    strcpy_s(reinterpret_cast<char*>(g_ServerDataBuffer + 0x37c), 0xe8, "Killhouse Test");
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x374) = 0;    // room index
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x464) = 518;  // mapIndex, TAM_Killhouse
-    // 2026-11-03: the ORIGINAL ZNetwork.dll's room-join deserializer
-    // (decompiled_znetwork.c FUN_10087df0) writes the map index to BOTH
-    // +0x440 and +0x464. +0x440 is the copy the match-start path reads:
-    // GameClient's LoadControlMgr::RequestStartGame (FUN_101a6ba0) does
-    // `mapIndex = *(ServerData+0x440)` -> MapInfo record -> world file, and
-    // CGameClientShell's game-start routine (FUN_10151060) uses it for the
-    // game-mode lookup. Leaving it 0 meant "map 0" at match start.
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x440) = 518;  // mapIndex copy read at match start
-
-    // 2026-09-11: Room team/user-slot list, populated by GameClient.dll's
-    // thunk_FUN_1005a210 (the Game Room screen's per-slot refresh). Confirmed
-    // via decompile: this walks a 20-slot array of 116-byte (0x74) records
-    // starting at this SAME GetServerData() buffer, offset 0x48C (computed
-    // as an int-pointer +0x123 into the buffer, i.e. 0x123*4). Each slot is
-    // only considered occupied if ALL THREE of these record-relative fields
-    // pass:
-    //   rec+0x00 (int)  != 0   -- the record's own user index/id
-    //   rec+0x04 (byte) != 0   -- "occupied" flag
-    //   rec+0x0C (int)  != 2   -- must not be state 2 (left/kicked)
-    // Our buffer is all-zero by default, so every one of the 20 slots fails
-    // this gate -- confirmed to be why every visible team slot showed
-    // "-Unavailable-".
-    //
-    // REVERTED 2026-09-11 (продолжение 17): writing a passing record here
-    // (rec+0x00/+0x04/+0x08=1, +0x0C=0) plus buffer+0x000/+0x44C=1 caused a
-    // reproducible crash right after login -- log stops cleanly immediately
-    // after "LOGIN COMPLETE - FAKE SUCCESS" with zero further DISPATCH
-    // lines, the exact same signature as the earlier LobbyModeMapInfo
-    // vtable-header crash. Root cause theory: this same
-    // MonolithMenuUser*-populating code path is very likely ALSO driven by
-    // the lobby member list (not just the room screen) -- "Monolith Menu"
-    // sounds general-purpose, not room-specific -- so as soon as our record
-    // passes the occupancy gate, thunk_FUN_1005a210's field-processing code
-    // for Name/Level/ClanMark/ClanName/TeamIndex/RoomState (rec+0x10
-    // onward) executes for the very first time ever (previously always
-    // skipped, since no record ever passed the gate against an all-zero
-    // buffer) -- and that code is the part we could NOT reliably map (see
-    // продолжение 16): the real SetVariable "value" arguments for those
-    // fields are buried in SEH-scratch-slot reuse. Something in there is
-    // apparently dereferencing a genuine pointer sourced from our
-    // all-zero record bytes, contradicting the "embedded char array, safe
-    // when zero" hypothesis used to justify leaving them zero.
-    //
-    // Left fully disabled (record and buffer+0x000/+0x44C NOT written, i.e.
-    // back to the known-safe all-zero baseline) until this can be
-    // investigated with an actual debugger (x32dbg) rather than further
-    // decompile guessing -- see продолжение 17 for the plan.
-    //
-    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48C + 0x00) = 1;  // rec+0x00: user index
-    // *reinterpret_cast<uint8_t*>(g_ServerDataBuffer + 0x48C + 0x04) = 1;  // rec+0x04: occupied flag
-    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48C + 0x08) = 1;  // rec+0x08: connection state
-    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48C + 0x0C) = 0;  // rec+0x0C: must != 2
-    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x000) = 1;         // "is me" reference index
-    // *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x44C) = 1;         // "is host" reference index
-    //
-    // 2026-09-11 (продолжение 18): re-enabled at the user's request, with an
-    // added mitigation for the specific crash theory above. Monolith's own
-    // global-variable naming convention independently confirms field types
-    // for everything this record feeds via SetVariable:
-    //   "_global.g_anMonolithMenuUserIndex"      -- "an" = int   -> rec+0x00
-    //   "_global.g_anMonolithMenuUserLevel"      -- "an" = int
-    //   "_global.g_asMonolithMenuUserName"       -- "as" = STRING
-    //   "_global.g_abMonolithMenuUserIsClan"     -- "ab" = bool  -> rec+0x34 (confirmed)
-    //   "_global.g_anMonolithMenuUserClanMark0/1/2" -- "an" = int
-    //   "_global.g_asMonolithMenuUserClanName"   -- "as" = STRING
-    //   "_global.g_anMonolithMenuUserTeamIndex"  -- "an" = int
-    //   "_global.g_anMonolithMenuUserRoomState"  -- "an" = int
-    // Exactly two fields are strings (Name, ClanName); everything else is a
-    // plain int or bool. We could NOT pin down which of the ~24 still-
-    // unmapped 4-byte slots (rec+0x10..+0x70, skipping the confirmed
-    // rec+0x34 IsClan bool) are those two string fields -- this function is
-    // unusually obscured by SEH-unwind scaffolding, to the point that even
-    // an unconditional late line in the decompile
-    // (`*(int*)(iStack_9c+0x378)`) LOOKS like a near-null dereference but
-    // demonstrably does not crash on every call (every earlier room-screen
-    // refresh with an empty slot table ran it fine), proving Ghidra's
-    // variable tracking is unreliable across large stretches of this
-    // specific function and cannot be trusted for a precise offset-to-field
-    // mapping here without a live debugger.
-    //
-    // Rather than guess a single offset for Name/ClanName, every remaining
-    // unmapped slot is pointed at a short, always-valid static placeholder
-    // string. Reasoning: leaving a real string field as 0 is now CONFIRMED
-    // to crash (продолжение 17). A plain-int field (Level/ClanMark0-2/
-    // TeamIndex/RoomState) that ends up holding a pointer-sized value
-    // instead of a small int is expected to fail softer -- a cosmetically
-    // wrong displayed number, or a clamped/ignored value if the real code
-    // range-checks it (plausible for TeamIndex/RoomState, since in the real
-    // game these fields are populated over the network from other players
-    // and the client must already tolerate bad values there without
-    // crashing). This is an explicit, acknowledged experiment, not a
-    // confirmed-safe mapping -- if it crashes, the plan is a live x32dbg
-    // session rather than a third blind guess.
-    // 2026-11-03: the placeholder-pointer experiment above is SUPERSEDED by
-    // the real record layout, read straight from the ORIGINAL ZNetwork.dll's
-    // room-user-list writer (decompiled_znetwork.c FUN_10088290, called per
-    // user by FUN_10087330 before it fires ROOM_USER_INFO). Record = 0x1d
-    // dwords = 0x74 bytes, 20 slots from +0x48C; strings are INLINE wide
-    // strings (StrCpyW), not pointers -- which is why the "Host" pointer
-    // bytes showed up as garbage names instead of crashing:
-    //   +0x00 int   user index           +0x04 byte occupied(=1)
-    //   +0x08 int   state (switch 2..7)  +0x0C int  =0 (2 = left)
-    //   +0x10 int   team: 1/2/0          +0x14 int  (byte arg: level/char)
-    //   +0x18 wchar nickname[16]         +0x38..+0x44 four ints (clan marks)
-    //   +0x48 wchar clan name            +0x70 byte flag (ready?)
-    // The writer also sets ServerData+0x3C = my team when userIndex == *sd.
-    WriteFakeRoomUserRecord();
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x000) = 1;         // "is me" reference index
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x44C) = 1;         // "is host" reference index
-
-    // ---------------------------------------------------------------------
-    // Player profile fields -- offsets confirmed by disassembling
-    // thunk_FUN_10059580 (Multiplayer.OnSetMyInfo), which reads them
-    // directly from GetServerData(). The Grade/Level values match what we
-    // previously tried to set via an incorrect method (patching string-name
-    // addresses instead of the actual storage) -- now we apply them in the
-    // right place.
-    // ---------------------------------------------------------------------
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x38)   = 10;   // MyUserGrade
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x40)   = 10;   // MyLevel -- kept in sync with g_FakeUserInfo.level below
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x48)   = 0;    // purpose not confirmed -- safe 0
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x50)   = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x58)   = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x60)   = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x64)   = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x68)   = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x70)   = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x74)   = 0;
-    *reinterpret_cast<uint8_t*>(g_ServerDataBuffer + 0x118)  = 0;    // byte flag, purpose not confirmed
-    *reinterpret_cast<uint8_t*>(g_ServerDataBuffer + 0x1c9)  = 0;    // byte flag, purpose not confirmed
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x1e90) = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x1e94) = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x1e98) = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x1ea0) = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x1ed0) = 0;
-    *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x1ee0) = 0;
-    // +0x1e4c is passed as an ADDRESS directly (not dereferenced before
-    // the call) -- looks like an inline string (e.g., nickname). Put a valid,
-    // null-terminated string here to avoid reading garbage if something tries
-    // to read it as a C-string.
-    strcpy_s(reinterpret_cast<char*>(g_ServerDataBuffer + 0x1e4c), 64, "TestUser");
+    // 2026-11-10: everything else that used to be written here by hand
+    // (open-map vector +0x2690, "current room" block +0x374.., room user
+    // slot +0x48C, profile fields +0x38.., clan name +0x1e4c) is now owned
+    // by the offline world model -- FoWorldInitOnce() in fo_world.inc writes
+    // the real layouts (wide strings, not narrow; the whole MapInfo map list;
+    // profile/inventory/friends/mail/clan vectors).
+    FoWorldInitOnce();
 
     // hostPort 27889 -- the "LithTech" port constant confirmed in the
     // fear-online-server reference project (proudnet/game_start.go,
@@ -593,75 +372,10 @@ static void InitFakeServerDataOnce() {
     g_ServerHostData.isRoomOwner = 0;
 }
 
-// ----------------------------------------------------------------------------
-// Fake profile values below are cross-checked against the fear-online-server
-// reference project (a separate, more complete ProudNet reimplementation --
-// see C:\OSPanel6\home\fear-online-server), specifically:
-//   - server/.env.example: STARTING_POINT=50000, STARTING_CASH=50000
-//   - server/internal/catalog/catalog.go: StarterItems (one A.T.C. character,
-//     one T.F. character, one M16 primary weapon -- these ItemIndex values are
-//     the real ones extracted from the game's own GameItem.csv/.Arch01 data,
-//     not invented) and MapInfo.csv row for TAM_Killhouse (MapIndex 518,
-//     TeamDeathMatch) -- a small, simple map, good for a first "does it load"
-//     test. None of this changes the wire protocol (we still never talk to
-//     that Go server / real ProudNet) -- it only makes the numbers we hand to
-//     GameClient.dll's callbacks resemble real, plausible game data instead of
-//     placeholders like "Item 1"/"Room 1".
-// ----------------------------------------------------------------------------
-static LoginData g_FakeLoginData = {
-    0, 1001, 0x12345678, 0, "TestUser", 1, 1
-};
-
-static UserInfo g_FakeUserInfo = {
-    1001, 10, 500, 1000, "TestUser", 0, 0, 50000, 50000
-};
-
-static LoginFailData g_FakeLoginFail = {
-    0, "Success"
-};
-
-static GateServerInfo g_FakeGateServerInfo = {
-    1, 1, "Test Server", "127.0.0.1", 7777, 100, 500
-};
-
-static GateChannelInfo g_FakeChannels[3] = {
-    {1, "Channel 1", 10, 100, 0},
-    {2, "Channel 2", 25, 100, 0},
-    {3, "Channel 3", 50, 100, 0}
-};
-
-static GateLobbyInfo g_FakeGateLobbyInfo = {
-    1, "Lobby 1", 10, 100
-};
-
-// A single joinable room advertised at login, pre-filled for TAM_Killhouse
-// (MapIndex 518 in the real MapInfo.csv, TeamDeathMatch mode). "mode"/"mapId"
-// field meaning inside LobbyRoomInfo is our own guess (see struct above) --
-// not confirmed against a real client the way GetServerData()'s offsets are.
-static LobbyRoomInfo g_FakeRooms[1] = {
-    {1, "Killhouse Test", 1, 16, 5 /*TeamDeathMatch*/, 518 /*TAM_Killhouse*/, 0, ""}
-};
-
-// "Open map" advertisement -- see LobbyModeMapInfo comment above. Must list
-// the same mapId as g_FakeRooms[0] (518 / TAM_Killhouse) or the client will
-// keep rejecting it as "Map does not exist" when creating a room.
-static LobbyModeMapInfo g_FakeModeMaps[1] = {
-    {518 /*TAM_Killhouse*/, 1 /*isOpen*/}
-};
-
-// Real ItemIndex values from the reference project's extracted catalog
-// (StarterItems in catalog.go): an A.T.C. character, a T.F. character, and an
-// M16 primary weapon -- the minimum kit the real server grants a brand-new
-// account. Using the real indices (rather than placeholder 1..5) means that,
-// if GameClient.dll resolves item names/models by ItemIndex against its own
-// local catalog/archives (it ships the same GameItem data the client reads
-// for shop/inventory display), these should actually resolve to real items
-// instead of "unknown item".
-static ItemInfo g_FakeItems[3] = {
-    {11100101, "A.T.C. Character", 0, 0, 1, 1, 0, 1},
-    {12100101, "T.F. Character",   0, 0, 1, 1, 0, 1},
-    {21102201, "M16",              0, 0, 1, 1, 0, 1}
-};
+// (2026-11-10: the old LoginData/UserInfo/GateChannelInfo/LobbyRoomInfo/
+// ItemInfo fake structs that used to be passed to the callbacks are gone --
+// every callback is a no-argument cdecl notification that re-reads the sd
+// buffer; the data now lives in the offline world model, fo_world.inc.)
 
 // ============ PATCHING GLOBAL VARIABLES REMOVED ============
 // Previously there was a table of "offset -> value" for writing directly into
@@ -1174,20 +888,6 @@ static bool CallCallbackNotification(const char* name) {
     return returned;
 }
 
-static void DeliverPendingRoomEntry() {
-    if (InterlockedCompareExchange(&g_RoomEntryPending, 0, 0) == 0 ||
-        InterlockedCompareExchange(&g_RoomEntered, 0, 0) != 0) return;
-
-    // Consume once before dispatch to protect against callback re-entry.
-    InterlockedExchange(&g_RoomEntryPending, 0);
-    InterlockedExchange(&g_RoomEntered, 1);
-    Log("[Proxy] Delivering deferred local room-entry notifications from Tick()");
-    CallCallbackNotification("ROOM_OPEN_MAP_INFO");
-    CallCallbackNotification("ROOM_INFO");
-    CallCallbackNotification("ROOM_JOIN");
-    Log("[Proxy] Deferred room-entry notification sequence finished; no map start was requested");
-}
-
 // GameClient's start callback signature is visible in the forwarding proxy
 // used by fear-online-server: (wide map name, int16 name length, int intrude).
 // Keep this separate from the generic callback helpers so a missing/incorrect
@@ -1249,30 +949,11 @@ static void CallCallbackInt1Safe(const char* name, int arg) {
     }
 }
 
-// Pushes the "which maps/modes are open" + "which rooms exist" data the
-// GAME ROOM LIST / HOST GAME screen needs. Originally this only ran once,
-// inside LoginServer_EX() -- i.e. at account login, long before the player
-// has even reached the main menu. That matches neither how the real
-// fear-online-server behaves (its rmiRequestLobbyJoin / rmiRequestRoomList
-// handlers -- lobby.go's join()/roomList() -- fire when the client actually
-// asks to enter the lobby / refresh the room list, NOT at login) nor a
-// plausible explanation for why "36001007 Map does not exist" and the empty
-// mode list survived every earlier struct-layout fix: if GameClient.dll's
-// room-create screen clears/rebuilds its own map+mode state each time it is
-// opened (expecting a fresh push in response to the request it just made),
-// a one-shot push at login could be long gone -- overwritten or simply
-// never seen by that screen -- by the time HOST GAME is clicked.
-// Send_LOBBY_ROOM_INFO() (below) is the export the client actually calls
-// when the GAME ROOM LIST screen opens/refreshes (confirmed via the proxy
-// log -- it fires every time that screen is reached), so this same push now
-// also happens there, not just at login.
-static void PushLobbyMapAndRoomData(const char* reason) {
-    Log("[Proxy] PushLobbyMapAndRoomData (from %s)", reason);
-    CallCallbackArray("LOBBY_ALL_MODE_MAP", g_FakeModeMaps, 1);
-    CallCallbackArray("LOBBY_MODE_MAP", g_FakeModeMaps, 1);
-    CallCallbackArray("ROOM_EVENT_MAP_INFO", g_FakeModeMaps, 1);
-    CallCallbackArray("LOBBY_ROOM_INFO", g_FakeRooms, 1);
-}
+// ============ OFFLINE WORLD MODEL (2026-11-10) ============
+// Profile, inventory/hangar, rooms/maps, chat, friends, mail, clan -- all
+// written into the sd/hd buffers with the ORIGINAL DLL's layouts and
+// answered from Tick() through a job queue. See fo_world.inc.
+#include "fo_world.inc"
 
 // ============ Main Exports ============
 extern "C" __declspec(dllexport) void* GetServerData() {
@@ -1309,7 +990,6 @@ extern "C" __declspec(dllexport) void Tick() {
     TryInstallLTClientCPrintHook();
     g_LastTickMs = GetTickCount();
 
-    DeliverPendingRoomEntry();
     DeliverPendingGameLoadComplete();
     DeliverPendingBeginRound();
 
@@ -1329,42 +1009,14 @@ extern "C" __declspec(dllexport) void Tick() {
         // to our single fake channel.
         *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e0) = &g_FakeChannels44[0];
         *reinterpret_cast<ChannelRecord**>(g_ServerDataBuffer + 0x25e4) = &g_FakeChannels44[0] + 1;
-
-        // Open-map index vector at +0x2690/+0x2694 (see InitFakeServerDataOnce
-        // comment) -- re-assert the same way, same reason.
-        *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2690) = &g_OpenMapIndices[0];
-        *reinterpret_cast<uint16_t**>(g_ServerDataBuffer + 0x2694) =
-            &g_OpenMapIndices[0] + (sizeof(g_OpenMapIndices) / sizeof(g_OpenMapIndices[0]));
-
-        // "Current room" fields at +0x374/+0x37c/+0x464 (see
-        // InitFakeServerDataOnce comment) -- re-assert the same way.
-        strcpy_s(reinterpret_cast<char*>(g_ServerDataBuffer + 0x37c), 0xe8, "Killhouse Test");
-        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x374) =
-            (InterlockedCompareExchange(&g_RoomEntered, 0, 0) != 0) ? 1 : 0;
-        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x464) = 518;
-        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x440) = 518;  // see InitFakeServerDataOnce
-
-        // Team/user-slot record at +0x48C, plus the "is me"/"is host"
-        // reference fields at +0x000/+0x44C (see the продолжение 18 comment
-        // in InitFakeServerDataOnce()) -- re-assert the same way, same
-        // reason. Was reverted in продолжение 17 after a crash; re-enabled
-        // here with the placeholder-string mitigation described there.
-        WriteFakeRoomUserRecord();   // real layout, see InitFakeServerDataOnce (2026-11-03)
-        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x000) = 1;
-        *reinterpret_cast<int32_t*>(g_ServerDataBuffer + 0x44C) = 1;
-
-        // The other known "dangerous" vectors (+0x110/0x114/0x118 --
-        // MY_USER_INFO-related, +0x25f0/0x25f4 -- lobbies) we deliberately keep empty
-        // (begin==end==0), since their exact field layout is not confirmed --
-        // we explicitly re-assert this on every tick, so that no extraneous code
-        // (our own InitFakeServerDataOnce and other callbacks) accidentally leaves
-        // garbage there between calls.
-        *reinterpret_cast<uint32_t*>(g_ServerDataBuffer + 0x110) = 0;
-        *reinterpret_cast<uint32_t*>(g_ServerDataBuffer + 0x114) = 0;
-        *reinterpret_cast<uint32_t*>(g_ServerDataBuffer + 0x118) = 0;
-        *reinterpret_cast<uint32_t*>(g_ServerDataBuffer + 0x25f0) = 0;
-        *reinterpret_cast<uint32_t*>(g_ServerDataBuffer + 0x25f4) = 0;
+        // 2026-11-10: every other sd/hd structure (open maps, items, chat
+        // deque, friends/mail/clan vectors, current room block, room user
+        // slot) is re-asserted from the offline world model.
+        FoReassertSd();
     }
+
+    // Deliver the queued "server answers" (room entry, hangar, clan, chat...).
+    FoRunQueuedJobs();
 
     if (!loggedOnce && callCount > 2) {
         Log("[Proxy] Tick() is being called regularly -- reasserting buffer invariants each tick");
@@ -1400,7 +1052,7 @@ extern "C" __declspec(dllexport) void destoryed() {
     Log("[Proxy] destoryed()");
 }
 
-extern "C" __declspec(dllexport) int GetRoomCount() { return 3; }
+extern "C" __declspec(dllexport) int GetRoomCount() { return (int)g_FoLobbyRoomCount + (g_FoRoom.active ? 1 : 0); }
 
 extern "C" __declspec(dllexport) void DediDisconnect() {
     Log("[Proxy] DediDisconnect()");
@@ -1411,51 +1063,23 @@ extern "C" __declspec(dllexport) void DediStartConnect_EX() {
 }
 
 // ============ LoginServer_EX ============
-extern "C" __declspec(dllexport) int __stdcall LoginServer_EX(
-    const char* ip, short port, const wchar_t* pb, const char* uid, void* extra
+// Real prototype (ORIGINAL ZNetwork.dll, plain `ret` = cdecl, all strings
+// wide): LoginServer_EX(const wchar_t* ip, short port, const wchar_t* tag
+// ("AE"/"NO"/"WI"), const wchar_t* uid, void* extra) -> bool. The old
+// __stdcall declaration popped 20 bytes the caller then popped again.
+extern "C" __declspec(dllexport) int LoginServer_EX(
+    const wchar_t* ip, short port, const wchar_t* tag, const wchar_t* uid, void* extra
 ) {
+    wchar_t wip[64], wtag[8], wuid[64];
+    SafeWCopy(wip, 64, ip); SafeWCopy(wtag, 8, tag); SafeWCopy(wuid, 64, uid);
     Log("[Proxy] ========================================");
-    Log("[Proxy] LOGIN START");
+    Log("[Proxy] LOGIN START (offline)");
     Log("[Proxy] ========================================");
-    Log("[Proxy] LoginServer_EX(ip=%s, port=%d, uid=%s)", 
-        ip ? ip : "null", port, uid ? uid : "null");
-    Log("[Proxy] IS_HOST: %d, IS_DEDI: %d", IS_HOST(), IS_DEDI());
-    
+    Log("[Proxy] LoginServer_EX(ip=%ls, port=%d, tag=%ls, uid=%ls, extra=0x%p)", wip, (int)port, wtag, wuid, extra);
     InitFakeServerDataOnce();
-    
-    Log("[Proxy] ServerData updated");
-    
-    CallCallback<LoginData>("LOGIN_DATA", &g_FakeLoginData);
-    CallCallback2<UserInfo>("MY_USER_INFO", &g_FakeUserInfo, 0);
-    CallCallback<GateServerInfo>("GATE_SERVER_INFO", &g_FakeGateServerInfo);
-    CallCallbackArray("GATE_CHANNEL_INFO", g_FakeChannels, 3);
-    CallCallback<GateLobbyInfo>("GATE_LOBBY_INFO", &g_FakeGateLobbyInfo);
-    CallCallback<GateServerInfo>("GATE_SERVER_JOIN", &g_FakeGateServerInfo);
-    CallCallback2<GateChannelInfo>("GATE_CHANNEL_JOIN", &g_FakeChannels[0], 0);
-    CallCallback<GateLobbyInfo>("LOBBY_JOIN", &g_FakeGateLobbyInfo);
-    CallCallback<UserInfo>("LOBBY_USER_INFO", &g_FakeUserInfo);
-    // Reverted to the exact inline form confirmed crash-free before the
-    // PushLobbyMapAndRoomData refactor (see doc, "продолжение 4"): the
-    // refactored/helper-function version reproduced a hard, deterministic
-    // crash during THIS call's own byte dump (LOBBY_JOIN), even though the
-    // helper is only invoked AFTER this line -- i.e. not explainable by
-    // control flow. Most likely some pre-existing memory-layout-sensitive
-    // bug elsewhere got tickled by the binary changing shape, not a logic
-    // error in the new calls themselves. Keeping this block textually
-    // identical to the last known-good build while we retest the timing
-    // idea via Send_LOBBY_ROOM_INFO() alone (see there), to isolate whether
-    // it's really the refactor here that's sensitive, or something else.
-    CallCallbackArray("LOBBY_ALL_MODE_MAP", g_FakeModeMaps, 1);
-    CallCallbackArray("LOBBY_MODE_MAP", g_FakeModeMaps, 1);
-    CallCallbackArray("ROOM_EVENT_MAP_INFO", g_FakeModeMaps, 1);
-    CallCallbackArray("LOBBY_ROOM_INFO", g_FakeRooms, 1);
-    // CallCallback<LoginFailData>("LOGIN_FAIL", &g_FakeLoginFail);
-
-    CallCallbackArray("ITEM_INFO", g_FakeItems, 3);
-    
-    Log("[Proxy] ========================================");
-    Log("[Proxy] LOGIN COMPLETE - FAKE SUCCESS");
-    Log("[Proxy] ========================================");
+    // The real server answers asynchronously (AnswerCreateCredentialSuccess ->
+    // LOGIN_DATA, then the login chain). Deliver the whole chain from Tick().
+    FoPost(JobLoginSequence, "LoginSequence");
     return 1;
 }
 
@@ -1577,48 +1201,14 @@ extern "C" __declspec(dllexport) void Set_OnIoDisonnectedCallback(void* callback
     }
 
 extern "C" __declspec(dllexport) int Send_LOBBY_USER_INFO() {
-    Log("[Proxy] Send_LOBBY_USER_INFO() -> 1");
+    Log("[Proxy] Send_LOBBY_USER_INFO() -> lobby user list");
+    FoPost(JobLobbyUsers, "LobbyUsers");
     return 1;
 }
 
-// ============ Room / match flow (EXPERIMENTAL -- next thing to verify) ============
-// Everything below is a first attempt at getting past the lobby into an
-// actual, walkable map. Unlike GetServerData()'s offsets (confirmed by
-// disassembly + live x32dbg sessions, see the big comment on
-// InitFakeServerDataOnce), none of the structures GameClient.dll expects from
-// ROOM_INFO/ROOM_JOIN/GAME_START-family callbacks have been confirmed the
-// same way -- this is a best-effort guess built by analogy with the
-// fear-online-server reference project's room/game flow (see
-// server/internal/proudnet/room.go and game_start.go there), reusing our own
-// already-defined LobbyRoomInfo struct where a room needs describing. Each
-// step logs heavily on purpose: check znetwork_proxy_log.txt (and DebugView)
-// after testing to see how far the client gets, and which call (if any)
-// needs a real payload instead of nullptr.
-// True means only that GameClient requested room creation. The room does not
-// exist in the UI until the server's room-state response callbacks are handled.
+// True once the client asked for a room (create or join) in this session.
 static bool g_RoomCreateRequested = false;
 static bool g_MatchStartSent = false;
-
-extern "C" __declspec(dllexport) int Send_LOBBY_ROOM_CREATE_EX(void* data) {
-    Log("[Proxy] Send_LOBBY_ROOM_CREATE_EX(0x%p)", data);
-    SafeDumpExternal("LOBBY_ROOM_CREATE_EX arg", data, 0x40);
-    const bool firstCreateRequest = !g_RoomCreateRequested;
-    g_RoomCreateRequested = true;
-    g_MatchStartSent = false;
-    if (firstCreateRequest) {
-        InterlockedExchange(&g_RoomEntered, 0);
-        InterlockedExchange(&g_RoomEntryPending, 1);
-    }
-
-    Log("[Proxy] Send_LOBBY_ROOM_CREATE_EX -> accepted; %s deferred room-entry notifications (no map start)",
-        firstCreateRequest ? "queued" : "duplicate request; preserving room state and not re-queuing");
-    return 1;
-}
-
-extern "C" __declspec(dllexport) int Send_ROOM_GAME_READY() {
-    Log("[Proxy] Send_ROOM_GAME_READY() -- acking only, no ready/leader state machine yet");
-    return 1;
-}
 
 // ============ Direct call into GameClient.dll's "ConsoleRunWorld" console
 // command implementation (2026-09-11, продолжение) ============
@@ -1943,7 +1533,7 @@ extern "C" __declspec(dllexport) int Send_ROOM_GAME_START() {
     InitFakeServerDataOnce();
     g_IsHost = true;
     g_ServerHostData.hostMode = 1;      // guess: 1 = actively hosting (was 0 = idle)
-    g_ServerHostData.hostPlayerId = g_FakeUserInfo.userId;
+    g_ServerHostData.hostPlayerId = g_Me.userId;
     strcpy_s(g_ServerHostData.hostIp, "127.0.0.1");
     g_ServerHostData.hostPort = 27889;  // confirmed LithTech port (see comment above)
     g_ServerHostData.isRoomOwner = 1;
@@ -2008,7 +1598,11 @@ extern "C" __declspec(dllexport) int Send_ROOM_GAME_START() {
         const int32_t myIndex = *reinterpret_cast<int32_t*>(sd + 0x000);  // 1 (set in InitFakeServerDataOnce/Tick)
         *reinterpret_cast<int32_t*>(sd + 0x450) = myIndex;               // game host index == me -> HOST branch
         *reinterpret_cast<uint8_t*>(sd + 0xEE8) = (uint8_t)myIndex;      // original: +0x450 is copied from this byte
-        *reinterpret_cast<int32_t*>(sd + 0x440) = 518;                   // map index copy read at match start
+        const int32_t mapIndex = g_FoRoom.active ? (int32_t)g_FoRoom.mapIndex : 518;
+        *reinterpret_cast<int32_t*>(sd + 0x440) = mapIndex;              // map index copy read at match start
+        *reinterpret_cast<int32_t*>(sd + 0x464) = mapIndex;
+        InterlockedExchange(&g_FoMatchActive, 1);                        // stop FoReassertSd() from rewriting +0x450/+0x43D
+        g_FoRoom.state = 1;
         *reinterpret_cast<int32_t*>(sd + 0xE84) = 1;
         *reinterpret_cast<uint8_t*>(sd + 0x43D) = 1;
         *reinterpret_cast<uint8_t*>(sd + 0xE80) = 1;
@@ -2018,8 +1612,9 @@ extern "C" __declspec(dllexport) int Send_ROOM_GAME_START() {
         *reinterpret_cast<int32_t*>(sd + 0x034) = 4;
         *reinterpret_cast<int32_t*>(sd + 0x2700) = 0;
         *reinterpret_cast<uint8_t*>(sd + 0x2704) = 0;
-        Log("[Proxy] ServerData game-start fields set: +0x000=%d +0x450=%d +0xEE8=%d +0xECC=0 +0x440=518",
-            myIndex, *reinterpret_cast<int32_t*>(sd + 0x450), (int)*reinterpret_cast<uint8_t*>(sd + 0xEE8));
+        Log("[Proxy] ServerData game-start fields set: +0x000=%d +0x450=%d +0xEE8=%d +0xECC=0 +0x440=%d (%s)",
+            myIndex, *reinterpret_cast<int32_t*>(sd + 0x450), (int)*reinterpret_cast<uint8_t*>(sd + 0xEE8),
+            mapIndex, FoMapFind((uint32_t)mapIndex) ? FoMapFind((uint32_t)mapIndex)->mapName : "unknown map");
     }
 
     // GAME_START_PRE first (the real server sends rmiNotifyRoomGame before
@@ -2068,27 +1663,13 @@ static void EnsureLocalMapStart(const char* source) {
     Send_ROOM_GAME_START();
 }
 
+// Stubs in the ORIGINAL DLL too (bare `ret`): LOBBY_ROOM_JOIN/CREATE/MAKE, ROOM_SETTING, ROOM_MAP, ROOM_MAP_CHANGE.
 extern "C" __declspec(dllexport) int Send_LOBBY_ROOM_JOIN(int roomId) {
-    Log("[Proxy] Send_LOBBY_ROOM_JOIN(%d) -> 1", roomId);
+    Log("[Proxy] Send_LOBBY_ROOM_JOIN(%d) -> no-op (original stub; the real join is Send_LOBBY_ROOM_ENTER)", roomId);
     return 1;
 }
-
-extern "C" __declspec(dllexport) int Send_LOBBY_QUICK_JOIN() {
-    Log("[Proxy] Send_LOBBY_QUICK_JOIN() -> 1");
-    return 1;
-}
-
-extern "C" __declspec(dllexport) int Send_LOBBY_ROOM_INFO() {
-    Log("[Proxy] Send_LOBBY_ROOM_INFO() -> 1");
-    // The client calls this when the GAME ROOM LIST screen opens/refreshes --
-    // re-push the map/mode/room data here too, not just once at login (see
-    // PushLobbyMapAndRoomData comment above for why).
-    PushLobbyMapAndRoomData("Send_LOBBY_ROOM_INFO");
-    return 1;
-}
-
 extern "C" __declspec(dllexport) int Send_ROOM_SETTING() {
-    Log("[Proxy] Send_ROOM_SETTING() -> 1");
+    Log("[Proxy] Send_ROOM_SETTING() -> no-op (original stub; the real one is Send_ROOM_DETAIL_SETTING_EX)");
     return 1;
 }
 
@@ -2199,58 +1780,37 @@ static void DeliverPendingBeginRound() {
     CallCallbackNotification("HOST_GAME_BEGIN_ROUND");
 }
 
+#include "fo_exports.inc"
+
 #define SEND_LIST \
     X(CAPSULE_BUY) X(CAPSULE_CLOSE) X(CAPSULE_OPEN) \
-    X(CHAT_ALL) X(CHAT_CLAN) X(CHAT_CLAN_MANAGER) X(CHAT_TEAM) X(CHAT_WHISPER) \
-    X(CHELLENGE_CLEAR) X(CLAN_CHANGE_CLANNAME) X(CLAN_CHANGE_MARK) \
-    X(CLAN_CHANGE_MASTER) X(CLAN_CHECK_CLANNAME) X(CLAN_CHECK_MARK) \
-    X(CLAN_CLOSE) X(CLAN_CREATE) X(CLAN_DELETE) X(CLAN_INVITE) \
-    X(CLAN_KICK_OUT) X(CLAN_MATCH_CANCEL) X(CLAN_MATCH_CREATE) \
-    X(CLAN_MATCH_START) X(CLAN_MEMBER_POSITION) X(CLAN_OPEN) X(CLAN_OUT) \
-    X(CLAN_REQUEST) X(CLAN_REQUEST_ACCEPT) X(CLAN_REQUEST_CANCEL) \
-    X(CLAN_REQUEST_REFUSE) X(CLAN_SEARCH) X(CLAN_SEARCH_MASTER) \
-    X(CLAN_UPDATE_INTRO) X(CLAN_UPDATE_NOTICE) X(DAILY_MISSION_CLEAR) \
-    X(DAILY_MISSION_INFO) X(DAILY_MISSION_START) X(FRIEND_DELETE) \
-    X(FRIEND_INVITE) X(FRIEND_REQUEST) X(FRIEND_REQUEST_ACCEPT) \
-    X(FRIEND_REQUEST_REFUSE) X(GAME_HIT_COUNT) X(GAME_LEAVE) \
-    X(GAME_PING) X(GATE_CHANNEL_JOIN) \
-    X(GATE_LOBBY_INFO) X(GATE_LOBBY_JOIN) X(GATE_SERVER_INFO) \
-    X(GATE_SERVER_JOIN) X(GIFT_DELETE_RECEIVE) X(GIFT_DELETE_SEND) \
-    X(GIFT_LOAD_RECEIVE_PAGE) X(GIFT_LOAD_SEND_PAGE) X(GIFT_READ) \
-    X(GIFT_RECEIVE) X(GIFT_WRITE) X(GM_BAN_USER) X(GM_KICK_USER) \
-    X(GM_NOTICE_MESSAGE) X(GM_QUIET_USER) X(GM_WARN_MESSAGE) \
-    X(HANGAR_BREAK_CUSTOM_SLOT) X(HANGAR_BREAK_WEAR) \
-    X(HANGAR_BUY_CUSTOM_SLOT) X(HANGAR_CLOSE) X(HANGAR_CUSTOM_BREAK) \
-    X(HANGAR_CUSTOM_BUY) X(HANGAR_CUSTOM_EQUIP) X(HANGAR_EQUIP_CUSTOM_SLOT) \
-    X(HANGAR_EQUIP_WEAR) X(HANGAR_ITEM_BUY) X(HANGAR_ITEM_DELETE) \
-    X(HANGAR_ITEM_EQUIP) X(HANGAR_ITEM_EXPIRE) X(HANGAR_ITEM_REPAIR) \
-    X(HANGAR_ITEM_RESELL) X(HANGAR_ITEM_USE) X(HANGAR_JOIN) X(HANGAR_LEAVE) \
-    X(HANGAR_MONEY) X(HANGAR_NICKNAME_CHANGE) X(HANGAR_OPEN) \
-    X(HANGAR_PARTS_SLOT) X(HANGAR_RECIPE_ITEM) X(HANGAR_WEAPON_CUSTOM_SLOT) \
-    X(HANGAR_WEAPON_SLOT) X(HANGAR_WEAR_SLOT) X(HOST_DAILY_MISSION_CLEAR) \
-    X(HOST_GAME_BOMB) X(HOST_GAME_CHECK_BODY) \
-    X(HOST_GAME_GHOST) X(HOST_GAME_INSTANT_RESPAWN) X(HOST_GAME_LEAVE) \
-    X(HOST_GAME_MUST_LOAD_COMPLETE) X(HOST_GAME_OCCUPY) X(HOST_GAME_PING) \
-    X(HOST_GAME_PVE_DATANET) X(HOST_GAME_PVE_DOLL) X(HOST_GAME_PVE_HELP) \
-    X(HOST_GAME_PVE_RANK) X(HOST_GAME_RESPAWN) X(HOST_GAME_RESPAWN_COMPLETE) \
-    X(HOST_GAME_ROUND_END_PVE) X(HOST_GAME_START_WATCH) \
-    X(HOST_GAME_SUPER_DEFUSING_KIT) X(HOST_GAME_TIMEOUT) \
-    X(HOST_GAME_USER_DEATH) X(HOST_GAME_USER_EQUIP) X(HOST_GAME_USER_ITEM) \
-    X(HOST_GAME_USER_KILL) X(HOST_GAME_WEAPON_CHANGE) X(HOST_GAME_ZOMBIE) \
-    X(LOBBY_CLAN_ROOM_INFO) X(LOBBY_LEAVE) X(LOBBY_MODE_MAP) \
-    X(LOBBY_REFRESH_CLAN_ROOM_INFO) X(LOBBY_REFRESH_ROOM_INFO) \
-    X(LOBBY_ROOM_CREATE) X(LOBBY_ROOM_ENTER) X(LOBBY_ROOM_MAKE) \
-    X(MY_GUIDE_CLEAR) X(MY_NICKNAME_CREATE) X(PERK_BREAK_SLOT) \
-    X(PERK_CLOSE) X(PERK_EQUIP_SLOT) X(PERK_INCREASE_SLOT) X(PERK_OPEN) \
-    X(PERK_OPEN_NEW) X(POST_CLEAR_RECEIVE) X(POST_CLEAR_SEND) X(POST_CLOSE) \
-    X(POST_DELETE_RECEIVE) X(POST_DELETE_SEND) X(POST_LOAD_RECEIVE_PAGE) \
-    X(POST_LOAD_SEND_PAGE) X(POST_OPEN) X(POST_READ) X(POST_WRITE) \
-    X(PURCHASE_FINALIZE) X(PURCHASE_INIT) X(RECIPE_CLOSE) X(RECIPE_ITEM) \
-    X(RECIPE_OPEN) X(RECIPE_OPEN_NEW) X(REPORT_USER) X(ROOM_DETAIL_SETTING) \
-    X(ROOM_DETAIL_SETTING_EX) \
-    X(ROOM_INVITE) X(ROOM_INVITE_USER_INFO) X(ROOM_LEAVE) X(ROOM_MAP) \
-    X(ROOM_MAP_CHANGE) X(ROOM_MATCH_CANCEL) X(ROOM_MATCH_JOIN) \
-    X(ROOM_MATCH_START) X(ROOM_USER_TEAM) X(SEARCH_USER) \
+    X(CHAT_CLAN_MANAGER) X(CHELLENGE_CLEAR) X(CLAN_MATCH_CANCEL) \
+    X(CLAN_MATCH_CREATE) X(CLAN_MATCH_START) X(DAILY_MISSION_CLEAR) \
+    X(DAILY_MISSION_INFO) X(DAILY_MISSION_START) X(GAME_HIT_COUNT) \
+    X(GAME_PING) X(GATE_CHANNEL_JOIN) X(GATE_LOBBY_INFO) \
+    X(GATE_LOBBY_JOIN) X(GATE_SERVER_INFO) X(GATE_SERVER_JOIN) \
+    X(GM_BAN_USER) X(GM_KICK_USER) X(GM_NOTICE_MESSAGE) \
+    X(GM_QUIET_USER) X(GM_WARN_MESSAGE) X(HANGAR_BREAK_CUSTOM_SLOT) \
+    X(HANGAR_BUY_CUSTOM_SLOT) X(HANGAR_EQUIP_CUSTOM_SLOT) \
+    X(HANGAR_JOIN) X(HANGAR_LEAVE) X(HANGAR_NICKNAME_CHANGE) \
+    X(HANGAR_PARTS_SLOT) X(HANGAR_RECIPE_ITEM) \
+    X(HANGAR_WEAPON_CUSTOM_SLOT) X(HANGAR_WEAPON_SLOT) \
+    X(HANGAR_WEAR_SLOT) X(HOST_DAILY_MISSION_CLEAR) X(HOST_GAME_BOMB) \
+    X(HOST_GAME_CHECK_BODY) X(HOST_GAME_GHOST) \
+    X(HOST_GAME_INSTANT_RESPAWN) X(HOST_GAME_LEAVE) \
+    X(HOST_GAME_MUST_LOAD_COMPLETE) X(HOST_GAME_OCCUPY) \
+    X(HOST_GAME_PING) X(HOST_GAME_PVE_DATANET) X(HOST_GAME_PVE_DOLL) \
+    X(HOST_GAME_PVE_HELP) X(HOST_GAME_PVE_RANK) X(HOST_GAME_RESPAWN) \
+    X(HOST_GAME_RESPAWN_COMPLETE) X(HOST_GAME_ROUND_END_PVE) \
+    X(HOST_GAME_START_WATCH) X(HOST_GAME_SUPER_DEFUSING_KIT) \
+    X(HOST_GAME_TIMEOUT) X(HOST_GAME_USER_DEATH) \
+    X(HOST_GAME_USER_EQUIP) X(HOST_GAME_USER_ITEM) \
+    X(HOST_GAME_USER_KILL) X(HOST_GAME_WEAPON_CHANGE) \
+    X(HOST_GAME_ZOMBIE) X(LOBBY_CLAN_ROOM_INFO) \
+    X(LOBBY_REFRESH_CLAN_ROOM_INFO) X(LOBBY_ROOM_CREATE) \
+    X(LOBBY_ROOM_MAKE) X(PURCHASE_FINALIZE) X(PURCHASE_INIT) \
+    X(ROOM_DETAIL_SETTING) X(ROOM_MAP) X(ROOM_MAP_CHANGE) \
+    X(ROOM_MATCH_CANCEL) X(ROOM_MATCH_JOIN) X(ROOM_MATCH_START) \
     X(TUTORIAL_CLEAR) X(TUTORIAL_CLOSE) X(TUTORIAL_OPEN)
 
 #define X(name) SEND_STUB(name)
